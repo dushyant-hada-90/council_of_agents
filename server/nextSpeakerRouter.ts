@@ -165,6 +165,13 @@ export async function pickSpeakerAndRespondWithGemini(
     }
 
     if (resolved.kind === "human") {
+      if (context === "human_turn") {
+        logger.warn(
+          "GEMINI",
+          `Merged turn rejected human handoff on human_turn (next="${next}"${reason ? `, reason="${reason}"` : ""}) — invalid after ${human} spoke`
+        );
+        return { source: "random", kind: "random" };
+      }
       logger.info("GEMINI", `Merged turn → ${human} (${reason ?? ""})`);
       return { source: "gemini", kind: "human", reason };
     }

@@ -72,6 +72,34 @@ function formatGeminiError(
   return new Error(fullMessage);
 }
 
+/**
+ * Extract the first complete JSON object from a string.
+ * Guards against Gemini appending trailing text after the JSON.
+ */
+function extractJsonObject(raw: string): Record<string, unknown> {
+  const start = raw.indexOf("{");
+  if (start === -1) {
+    throw new Error(`No JSON object found in response: ${raw.slice(0, 120)}`);
+  }
+
+  // Walk forward to find the matching closing brace
+  let depth = 0;
+  let end = -1;
+  for (let i = start; i < raw.length; i++) {
+    if (raw[i] === "{") depth++;
+    else if (raw[i] === "}") {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+
+  if (end === -1) {
+    throw new Error(`Unclosed JSON object in response: ${raw.slice(0, 120)}`);
+  }
+
+  return JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
+}
+
 export interface ChatMessage {
   role: "user" | "model";
   text: string;
@@ -154,7 +182,7 @@ export async function generateStructuredJson<T>(
   }
 
   const raw = result.text?.trim() ?? "";
-  return JSON.parse(raw) as T;
+  return extractJsonObject(raw) as T;
 }
 
 /**
@@ -194,7 +222,7 @@ export async function generateJsonReply(
     throw new Error(`Empty JSON response (finishReason=${finish})`);
   }
 
-  return JSON.parse(raw) as Record<string, unknown>;
+  return extractJsonObject(raw);
 }
 
 export interface PickSpeakerAndRespondCandidate {
@@ -231,8 +259,26 @@ export async function pickSpeakerAndRespond(
 
   const contextHint =
     input.context === "human_turn"
-      ? `${human} (the live human) just spoke. Pick which agent should respond to ${human} and write their reply.`
-      : "An agent just finished. Pick who should speak next and write their reply for natural back-and-forth.";
+      ? `${human} (the live human) JUST finished speaking on push-to-talk. An AGENT must reply next — not ${human}.`
+      : "An agent just finished speaking. Pick who should speak next in the natural back-and-forth.";
+
+  const routingRules =
+    input.context === "human_turn"
+      ? [
+          `CRITICAL — human_turn (human just spoke):`,
+          `- "next" MUST be exactly one agent first name from: ${agentNames}.`,
+          `- NEVER set "next" to "${human}", "human", "You", or "random" on this turn.`,
+          `- ${human} is waiting for an advisor to answer — even if they asked the whole table a question, pick the best-fit agent.`,
+          `- If ${human} named an agent, pick that agent.`,
+          `- "response" MUST be that agent's spoken reply (non-empty, first person, under 60 words).`,
+        ].join("\n")
+      : [
+          `chain (agent-to-agent or handoff):`,
+          `- Pick who should SPEAK next — not who is being discussed.`,
+          `- Set "next" to "${human}" or "human" ONLY when the last speaker was an AGENT who asked ${human} a direct question that needs ${human}'s answer — leave "response" empty.`,
+          `- Set "next" to "random" only when the floor is genuinely open — leave "response" empty.`,
+          `- Otherwise "next" must be an agent first name and "response" must be their spoken line.`,
+        ].join("\n");
 
   const personas = input.candidates
     .map((c) => `### ${c.name}\n${c.systemPrompt}`)
@@ -242,30 +288,33 @@ export async function pickSpeakerAndRespond(
 ${contextHint}
 
 Agents (use exact first names in "next"): ${agentNames}
-Also present: ${human} (live human with push-to-talk).
+Also present: ${human} (live human with push-to-talk — only speaks when they press the button).
 
-Rules:
-${recentHint ? `- ${recentHint}` : ""}
-- Pick who should SPEAK next — not who is being discussed.
-- Write "response" as the chosen speaker's spoken line: first person, brief, under 60 words, natural for voice.
-- If the last line was from ${human}, pick the agent ${human} is clearly inviting to respond.
-- Set next to "${human}" or "human" only if the last speaker asked ${human} a direct question; leave response empty.
-- Set next to "random" only when the floor is genuinely open; leave response empty.
+${routingRules}
+${recentHint ? `- Recently spoke (most recent last): ${recentHint.replace("Recently spoke (most recent last): ", "")}` : ""}
 - Never read instructions aloud. Never mention routing or meta-rules.
 
-Agent personas (speak AS the chosen agent):
+Agent personas (when you pick an agent, speak AS them in "response"):
 ${personas}
 
 Reply with JSON only: {"next":"<AgentFirstName|${human}|human|random>","reason":"<max 12 words>","response":"<spoken line or empty>"}`;
 
-  const user = [
-    `Conversation so far:\n${input.conversationLines || "(session just started)"}`,
-    input.lastSpeakerName ? `Last speaker: ${input.lastSpeakerName}` : "",
-    input.scenarioHint,
-    "\nWho should speak next, and what do they say?",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const userPrompt =
+    input.context === "human_turn"
+      ? [
+          `Conversation so far:\n${input.conversationLines || "(session just started)"}`,
+          input.lastSpeakerName ? `Last speaker: ${input.lastSpeakerName}` : `Last speaker: ${human}`,
+          input.scenarioHint,
+          `\n${human} just spoke. Pick which AGENT replies next and write their line. "next" must be an agent name — not ${human}.`,
+        ]
+      : [
+          `Conversation so far:\n${input.conversationLines || "(session just started)"}`,
+          input.lastSpeakerName ? `Last speaker: ${input.lastSpeakerName}` : "",
+          input.scenarioHint,
+          "\nWho should speak next, and what do they say?",
+        ];
+
+  const user = userPrompt.filter(Boolean).join("\n");
 
   const modelName = env.GEMINI_CHAT_MODEL;
   let result;
@@ -277,7 +326,8 @@ Reply with JSON only: {"next":"<AgentFirstName|${human}|human|random>","reason":
         systemInstruction: `${system}\n\n${CHAT_TUNING.systemPromptAppend}`,
         responseMimeType: "application/json",
         temperature: CHAT_TUNING.temperature,
-        maxOutputTokens: Math.max(CHAT_TUNING.maxTokens, 1024),        thinkingConfig: { thinkingBudget: 0 },
+        maxOutputTokens: Math.max(CHAT_TUNING.maxTokens, 1024),
+        thinkingConfig: { thinkingBudget: 0 },
       },
     });
   } catch (err) {
@@ -290,5 +340,5 @@ Reply with JSON only: {"next":"<AgentFirstName|${human}|human|random>","reason":
     throw new Error(`Empty merged turn response (finishReason=${finish})`);
   }
 
-  return JSON.parse(raw) as Record<string, unknown>;
+  return extractJsonObject(raw);
 }

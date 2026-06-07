@@ -11,7 +11,7 @@ import { AudioUsageTracker } from "./audioUsageTracker";
 import { S3AudioUploader, setMeetingS3Prefix } from "./s3AudioUploader";
 import { logger } from "./logger";
 import { bumpPlayoutEpoch, getPlayoutEpoch, resetPlayoutEpoch } from "./playoutEpoch";
-import { resolveHumanTranscript } from "./humanTranscribe";
+import { resolveHumanTranscript, type HumanTranscriptMeta } from "./humanTranscribe";
 import { getSupabaseAdmin } from "../lib/supabase/admin";
 import { getEnv } from "../lib/env";
 import { PCM16_BYTES_PER_MS } from "./agentSession";
@@ -44,6 +44,7 @@ export class ConferenceRoom {
 
   private humanAudioChunks: Buffer[] = [];
   private humanTranscriptDelivered = false;
+  private humanTranscriptStatus = "idle";
   private readonly idleTimeoutMs: number;
   private readonly onPermanentEnd: (reason: MeetingEndReason) => void;
   private lastActivityAt = Date.now();
@@ -68,6 +69,7 @@ export class ConferenceRoom {
 
     this.mixer = new AudioMixer();
     this.sessionRecorder = new SessionRecorder(
+      meetingConfig.meetingId,
       this.agents.map((a) => ({ id: a.id, name: a.name })),
       meetingConfig.humanName
     );
@@ -111,6 +113,7 @@ export class ConferenceRoom {
       humanName: meetingConfig.humanName,
       maxAiTurnsBeforeHuman: meetingConfig.maxAiTurnsBeforeHuman,
     });
+    this.orchestrator.setTranscriptStatusProvider(() => this.humanTranscriptStatus);
 
     this.wireOrchestrator();
     this.wireMixer();
@@ -330,16 +333,23 @@ export class ConferenceRoom {
     }
   }
 
-  private deliverHumanTranscript(text: string | null, source: string): void {
+  private deliverHumanTranscript(text: string | null, meta: HumanTranscriptMeta): void {
     if (this.humanTranscriptDelivered) return;
     this.humanTranscriptDelivered = true;
+    this.humanTranscriptStatus = meta.detail;
 
     if (this.audioUsage?.shouldBlockNewTurns()) {
+      const blocked: HumanTranscriptMeta = {
+        source: "error",
+        detail: "guest audio limit reached before transcript could be used",
+      };
+      this.humanTranscriptStatus = blocked.detail;
+      this.orchestrator.onHumanTranscript(null, blocked);
       this.requestUserEnd("audio_limit");
       return;
     }
 
-    this.orchestrator.onHumanTranscript(text);
+    this.orchestrator.onHumanTranscript(text, meta);
     if (text?.trim()) {
       this.persistTranscript({
         speakerId: "human",
@@ -355,7 +365,9 @@ export class ConferenceRoom {
         text: text.trim(),
         timestamp: Date.now(),
       });
-      logger.info("SYSTEM", `Human transcript (${source}): "${text}"`);
+      logger.info("SYSTEM", `Human transcript (${meta.source}): "${text}"`);
+    } else {
+      logger.warn("SYSTEM", `Human transcript empty (${meta.source}): ${meta.detail}`);
     }
   }
 
@@ -386,6 +398,7 @@ export class ConferenceRoom {
         this.humanTranscriptDelivered = false;
         const report = event.playbackReport as InterruptPlaybackReport | undefined;
         const newEpoch = bumpPlayoutEpoch();
+        this.sessionRecorder.markPttStart();
         this.orchestrator.onHumanSpeechStart(report, newEpoch);
         break;
       }
@@ -395,14 +408,41 @@ export class ConferenceRoom {
           return;
         }
         this.touchActivity();
-        this.sessionRecorder.markHumanPttEnd();
-        this.orchestrator.onHumanSpeechEnd();
         const chunks = this.humanAudioChunks.splice(0);
         this.humanAudioChunks = [];
+        const byteCount = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+        this.sessionRecorder.markPttEnd(chunks.length, byteCount);
+        this.orchestrator.onHumanSpeechEnd();
+        this.humanTranscriptStatus = `awaiting Google STT (${chunks.length} chunks, ${byteCount} bytes)`;
+
+        if (chunks.length === 0) {
+          this.sessionRecorder.markSttResult(null, "none", "no audio chunks captured on END_SPEECH");
+          this.deliverHumanTranscript(null, {
+            source: "none",
+            detail: "no audio chunks captured on END_SPEECH",
+          });
+          break;
+        }
+
+        this.sessionRecorder.markSttSubmit();
         void resolveHumanTranscript(chunks)
-          .then(({ text, source }) => this.deliverHumanTranscript(text, source))
-          .catch(() => {
-            if (!this.humanTranscriptDelivered) this.deliverHumanTranscript(null, "error");
+          .then((result) => {
+            this.humanTranscriptStatus = result.meta.detail;
+            this.sessionRecorder.markSttResult(
+              result.text,
+              result.meta.source as "google" | "none" | "error",
+              result.meta.detail
+            );
+            this.deliverHumanTranscript(result.text, result.meta);
+          })
+          .catch((err) => {
+            const detail = `transcription promise rejected: ${(err as Error).message}`;
+            this.humanTranscriptStatus = detail;
+            logger.warn("TRANSCRIBE", detail);
+            this.sessionRecorder.markSttResult(null, "error", detail);
+            if (!this.humanTranscriptDelivered) {
+              this.deliverHumanTranscript(null, { source: "error", detail });
+            }
           });
         break;
       }

@@ -1,23 +1,43 @@
 import { transcribePcm16 } from "./google/stt";
 import { logger } from "./logger";
 
-export type HumanTranscriptSource = "google" | "none";
+export type HumanTranscriptSource = "google" | "none" | "error";
+
+export interface HumanTranscriptMeta {
+  source: HumanTranscriptSource;
+  detail: string;
+}
+
+export interface HumanTranscriptResult {
+  text: string | null;
+  meta: HumanTranscriptMeta;
+}
 
 export async function resolveHumanTranscript(
   chunks: Buffer[]
-): Promise<{ text: string | null; source: HumanTranscriptSource }> {
+): Promise<HumanTranscriptResult> {
   if (chunks.length === 0) {
-    return { text: null, source: "none" };
+    const detail = "no audio chunks captured";
+    return { text: null, meta: { source: "none", detail } };
   }
+
+  const byteCount = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
 
   try {
-    const text = await transcribePcm16(chunks);
-    if (text?.trim()) {
-      return { text: text.trim(), source: "google" };
+    const stt = await transcribePcm16(chunks);
+    if (stt.text?.trim()) {
+      return {
+        text: stt.text.trim(),
+        meta: { source: "google", detail: `transcribed ${byteCount} bytes` },
+      };
     }
-  } catch (err) {
-    logger.warn("TRANSCRIBE", `Google STT failed: ${(err as Error).message}`);
-  }
 
-  return { text: null, source: "none" };
+    const detail = stt.detail;
+    logger.warn("TRANSCRIBE", `No speech text (${byteCount} bytes): ${detail}`);
+    return { text: null, meta: { source: "none", detail } };
+  } catch (err) {
+    const detail = `unexpected error: ${(err as Error).message}`;
+    logger.warn("TRANSCRIBE", detail);
+    return { text: null, meta: { source: "error", detail } };
+  }
 }

@@ -4,7 +4,7 @@ import { buildMeetingRoster } from "../lib/agents/roster";
 import { generateAgentResponse, type ChatMessage } from "./google/geminiChat";
 import { synthesizeSpeech, pcmToBase64Chunks } from "./google/tts";
 import { logger } from "./logger";
-import { PCM16_BYTES_PER_MS, type SessionState, type AgentSession } from "./agentSession";
+import { PCM16_BYTES_PER_MS, type SessionState, type AgentSession, type PipelineHooks } from "./agentSession";
 
 /**
  * Pipeline agent session: Gemini Flash (text) → Google TTS (audio).
@@ -81,7 +81,7 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
 
   triggerResponse(
     extraInstructions?: string,
-    options?: { preGeneratedText?: string }
+    options?: { preGeneratedText?: string; hooks?: PipelineHooks }
   ): void {
     if (this.isDestroyed || this.state === "SPEAKING") return;
     this.abortController?.abort();
@@ -92,27 +92,35 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
     this.currentTranscriptText = "";
     this.currentResponseAudioBytes = 0;
 
-    void this.runPipeline(extraInstructions, signal, options?.preGeneratedText);
+    void this.runPipeline(extraInstructions, signal, options?.preGeneratedText, options?.hooks);
   }
 
   private async runPipeline(
     extraInstructions: string | undefined,
     signal: AbortSignal,
-    preGeneratedText?: string
+    preGeneratedText?: string,
+    hooks?: PipelineHooks
   ): Promise<void> {
     const roster = buildMeetingRoster(this.humanName, this.allAgents);
     const systemPrompt = `${this.config.systemPrompt}\n\n${roster}`;
 
     try {
-      const text = preGeneratedText
-        ? preGeneratedText.trim()
-        : await generateAgentResponse({
-            systemPrompt,
-            conversationHistory: this.conversationHistory,
-            extraInstructions,
-          });
+      let text: string;
+      if (preGeneratedText) {
+        text = preGeneratedText.trim();
+        // Pre-generated: no Gemini call, text is already available
+      } else {
+        hooks?.onGeminiStart();
+        text = await generateAgentResponse({
+          systemPrompt,
+          conversationHistory: this.conversationHistory,
+          extraInstructions,
+        });
+        hooks?.onGeminiEnd(text);
+      }
 
       if (signal.aborted || this.isDestroyed) {
+        hooks?.onDone("cancelled");
         this.state = "READY";
         return;
       }
@@ -122,8 +130,12 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
       this.emit("transcriptDelta", text, this.agentId);
       this.emit("transcriptDone", text, this.agentId);
 
+      hooks?.onTtsStart();
       const pcm = await synthesizeSpeech(text, { voice: this.config.voice });
+      hooks?.onTtsEnd(pcm.byteLength);
+
       if (signal.aborted || this.isDestroyed) {
+        hooks?.onDone("cancelled");
         this.state = "READY";
         return;
       }
@@ -132,20 +144,30 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
       this.lastCompletedAudioBytes = pcm.byteLength;
 
       const chunks = pcmToBase64Chunks(pcm);
+      let isFirst = true;
       for (const chunk of chunks) {
         if (signal.aborted || this.isDestroyed) break;
+        if (isFirst) {
+          hooks?.onFirstAudioSent();
+          isFirst = false;
+        }
         this.emit("audioDelta", chunk, this.agentId);
+      }
+      if (!isFirst) {
+        hooks?.onLastAudioSent();
       }
 
       this.conversationHistory.push({ role: "model", text });
 
       this.state = "READY";
+      hooks?.onDone("completed");
       this.emit("responseDone", "completed", this.agentId);
     } catch (err) {
       if (!signal.aborted) {
         logger.error("PIPELINE", `${this.agentId} pipeline failed: ${(err as Error).message}`);
         this.emit("error", err as Error, this.agentId);
       }
+      hooks?.onDone(signal.aborted ? "cancelled" : "failed");
       this.state = "READY";
       this.emit("responseDone", "failed", this.agentId);
     }

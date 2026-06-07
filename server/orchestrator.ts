@@ -11,6 +11,8 @@ import {
   pickSpeakerAndRespondWithGemini,
   shouldContinueChainWithGemini,
 } from "./nextSpeakerRouter";
+import type { HumanTranscriptMeta } from "./humanTranscribe";
+import { getEnv } from "../lib/env";
 
 // ─── FSM State definitions ────────────────────────────────────────────────────
 
@@ -136,14 +138,15 @@ export class Orchestrator extends EventEmitter {
   private recentAgentSpeakerIds: string[] = [];
   private readonly RECENT_SPEAKER_BLOCK_TURNS = 2;
 
-  /** Waiting for Whisper transcript before picking who responds to the human. */
+  /** Waiting for human STT before picking who responds. */
   private awaitingHumanTranscript = false;
 
-  /** Fallback if transcription is slow or empty. */
+  /** Fallback if transcription is slow or never delivered. */
   private transcriptFallbackTimer: NodeJS.Timeout | null = null;
-  private readonly TRANSCRIPT_FALLBACK_MS = 6000;
+  private readonly transcriptFallbackMs = getEnv().HUMAN_STT_TIMEOUT_MS;
+  private transcriptStatusProvider: (() => string) | null = null;
 
-  /** Last human utterance from Whisper — used for name routing. */
+  /** Last human utterance from STT — used for name routing. */
   private lastHumanTranscript: string | null = null;
 
   /** True when the human directly named someone this turn — skip auto chain afterward. */
@@ -224,6 +227,11 @@ export class Orchestrator extends EventEmitter {
     this.humanName = options?.humanName ?? "You";
     this.maxAiTurnsBeforeHuman = options?.maxAiTurnsBeforeHuman ?? 4;
     logger.info("ORCHESTRATOR", "Gemini next-speaker router enabled");
+  }
+
+  /** RoomManager supplies live STT status for timeout fallback logs. */
+  public setTranscriptStatusProvider(provider: () => string): void {
+    this.transcriptStatusProvider = provider;
   }
 
   // ─── Agent registration ─────────────────────────────────────────────────────
@@ -497,23 +505,31 @@ export class Orchestrator extends EventEmitter {
     this.transcriptFallbackTimer = setTimeout(() => {
       this.transcriptFallbackTimer = null;
       if (this.awaitingHumanTranscript && this.state === "DECIDING") {
-        logger.warn("ORCHESTRATOR", "Transcript fallback — selecting responder without text.");
+        const status = this.transcriptStatusProvider?.() ?? "STT status unknown";
+        logger.warn(
+          "ORCHESTRATOR",
+          `Transcript fallback after ${this.transcriptFallbackMs}ms — selecting responder without text. ${status}`
+        );
+        this.recorder?.markSttTimedOut();
         this.scheduleAgentSelection();
       }
-    }, this.TRANSCRIPT_FALLBACK_MS);
+    }, this.transcriptFallbackMs);
   }
 
   /**
-   * Called when Whisper returns the human's utterance.
+   * Called when Google STT returns the human's utterance (or a failure/empty result).
    * Appends the utterance to conversation history; Gemini routes the next speaker.
    */
-  public onHumanTranscript(text: string | null): void {
+  public onHumanTranscript(text: string | null, meta?: HumanTranscriptMeta): void {
     if (!this.awaitingHumanTranscript || this.state !== "DECIDING") return;
 
     this.awaitingHumanTranscript = false;
     this.clearTranscriptFallbackTimer();
 
     this.lastHumanTranscript = text;
+    if (!text?.trim() && meta) {
+      logger.warn("ORCHESTRATOR", `Human transcript empty (${meta.source}): ${meta.detail}`);
+    }
     if (text?.trim()) {
       this.appendConversationTurn("human", "human", this.humanName, text);
       this.recorder?.recordTurn({
@@ -910,6 +926,7 @@ export class Orchestrator extends EventEmitter {
 
     if (!selectedAgent && this.routingEnabled) {
       this.emit("systemEvent", `GEMINI: routing + generating response…`);
+      this.recorder?.markRoutingStart(selectionContext);
       const pick = await pickSpeakerAndRespondWithGemini({
         humanName: this.humanName,
         turns: this.conversationTurns,
@@ -945,7 +962,10 @@ export class Orchestrator extends EventEmitter {
           this.lastHumanTranscript = null;
           return;
         }
-        logger.warn("ORCHESTRATOR", "Gemini said Human after human spoke — using random agent.");
+        logger.warn(
+          "ORCHESTRATOR",
+          `Gemini routed to ${this.humanName} after ${this.humanName} spoke (invalid on human_turn)${pick.reason ? ` — ${pick.reason}` : ""} — using random agent.`
+        );
       }
 
       if (pick.source === "gemini" && pick.kind === "agent") {
@@ -982,6 +1002,18 @@ export class Orchestrator extends EventEmitter {
       reason: geminiPickReason,
       label: selectionLabel,
     });
+
+    const routingMethod: "merged_gemini" | "named_direct" | "random" =
+      routingSource === "gemini" ? "merged_gemini"
+      : routingSource === "named_fallback" ? "named_direct"
+      : "random";
+    this.recorder?.markRoutingResult(
+      selectedAgent.id,
+      selectedAgent.name,
+      routingMethod,
+      geminiPickReason,
+      !!preGeneratedText
+    );
 
     this.isolateAgentInput(selectedAgent);
     const humanLine =
@@ -1042,6 +1074,9 @@ export class Orchestrator extends EventEmitter {
     if (selectionContext === "human_turn" && this.lastHumanTranscript) {
       const text = this.lastHumanTranscript;
       lines.push(`${this.humanName} just said: "${text}"`);
+      lines.push(
+        `ROUTING: ${this.humanName} just spoke on push-to-talk. Pick an AGENT to reply. Never route back to ${this.humanName}.`
+      );
       for (const hint of this.humanSpeakerNameHints(text)) {
         lines.push(hint);
       }
@@ -1332,9 +1367,10 @@ export class Orchestrator extends EventEmitter {
     this.emit("systemEvent", `SPEAKING: ${agent.name}`);
 
     logger.startTimer(`turn_latency_${agent.id}_${agent.speakCount}`);
+    const hooks = this.recorder?.beginAgentTurn(agent.id, agent.name, turnContext, !!preGeneratedText);
     agent.session.triggerResponse(
       preGeneratedText ? undefined : (extraInstructions ?? this.composeTurnInstructions(agent)),
-      preGeneratedText ? { preGeneratedText } : undefined
+      { preGeneratedText, hooks }
     );
   }
 
@@ -1549,6 +1585,7 @@ export class Orchestrator extends EventEmitter {
     this.emit("humanInvited", agent.id, agent.name);
     this.emit("agentSpeakingStart", agent.id, agent.name);
 
+    const hooks = this.recorder?.beginAgentTurn(agent.id, agent.name, "engagement", false);
     agent.session.triggerResponse(
       this.composeTurnInstructions(
         agent,
@@ -1557,7 +1594,8 @@ export class Orchestrator extends EventEmitter {
           `Address ${this.humanName} as "you" or "${this.humanName}" — never say "${agent.name}" as if you are talking to yourself. ` +
           "Keep it conversational and under 12 seconds. Only your voice; no meta commentary.",
         { skipDissent: true }
-      )
+      ),
+      { hooks }
     );
   }
 
