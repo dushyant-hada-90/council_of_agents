@@ -38,7 +38,7 @@ async function postTranscription(
   label: string
 ): Promise<string | null> {
   const formData = new FormData();
-  const blob = new Blob([wav], { type: "audio/wav" });
+  const blob = new Blob([new Uint8Array(wav)], { type: "audio/wav" });
   formData.append("file", blob, "speech.wav");
   formData.append("model", model);
   formData.append("language", "en");

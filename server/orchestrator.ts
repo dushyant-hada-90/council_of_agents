@@ -2,7 +2,7 @@ import { EventEmitter } from "events";
 import { RealtimeSession } from "./realtimeSession";
 import { AudioMixer } from "./audioMixer";
 import { logger } from "./logger";
-import { HUMAN_NAME } from "../personalities/agents";
+import type { MaxAiTurnsBeforeHuman } from "../lib/agents/types";
 import { InterruptPlaybackReport } from "./conferenceTypes";
 import { agentNamesMatch, normalizeAgentNameToken } from "./nameMatching";
 import { SessionRecorder } from "./sessionRecorder";
@@ -164,6 +164,15 @@ export class Orchestrator extends EventEmitter {
   /** Structured session replay artifact collector. */
   private readonly recorder: SessionRecorder | null;
 
+  /** Display name of the live human participant. */
+  private readonly humanName: string;
+
+  /** Max agent-only turns before inviting human participation. */
+  private readonly maxAiTurnsBeforeHuman: MaxAiTurnsBeforeHuman;
+
+  /** Agent turns since human last spoke (excluding engagement). */
+  private aiTurnsSinceHuman = 0;
+
   /** Bumped on interrupt so stale async Groq picks are ignored. */
   private selectionGeneration = 0;
 
@@ -202,11 +211,18 @@ export class Orchestrator extends EventEmitter {
       "The table may be trading dignity for efficiency. Push back — authentic connection is your stake, not neutral facilitation.",
   };
 
-  constructor(mixer: AudioMixer, groqApiKey?: string, recorder?: SessionRecorder) {
+  constructor(
+    mixer: AudioMixer,
+    groqApiKey?: string,
+    recorder?: SessionRecorder,
+    options?: { humanName?: string; maxAiTurnsBeforeHuman?: MaxAiTurnsBeforeHuman }
+  ) {
     super();
     this.mixer = mixer;
     this.groqApiKey = groqApiKey?.trim() || undefined;
     this.recorder = recorder ?? null;
+    this.humanName = options?.humanName ?? "You";
+    this.maxAiTurnsBeforeHuman = options?.maxAiTurnsBeforeHuman ?? 4;
     if (this.groqApiKey) {
       logger.info("ORCHESTRATOR", "Groq next-speaker router enabled");
     }
@@ -227,10 +243,11 @@ export class Orchestrator extends EventEmitter {
     this.agents.push(record);
 
     // Wire response lifecycle events
-    session.on("responseDone", (_status: string, agentId: string) => {
-      if (this.activeAgent?.id === agentId) {
-        this.handleAgentDone(agentId);
-      }
+    session.on("responseDone", (status: string, agentId: string) => {
+      if (this.activeAgent?.id !== agentId) return;
+      if (this.state !== "AGENT_SPEAKING") return;
+      if (/cancel/i.test(status)) return;
+      this.handleAgentDone(agentId);
     });
 
     session.on("audioDelta", (_delta: string, id: string) => {
@@ -238,6 +255,7 @@ export class Orchestrator extends EventEmitter {
     });
 
     session.on("transcriptDone", (text: string, agentId: string) => {
+      if (this.state !== "AGENT_SPEAKING" || this.activeAgent?.id !== agentId) return;
       const agent = this.findAgent(agentId);
       if (agent && text.trim()) {
         this.appendConversationTurn("agent", agentId, agent.name, text);
@@ -284,6 +302,7 @@ export class Orchestrator extends EventEmitter {
     this.engagementTurnActive = false;
     this.lastHumanTranscript = null;
     this.chainTurnCount = 0;
+    this.aiTurnsSinceHuman = 0;
     this.recentAgentSpeakerIds = [];
     this.selectionGeneration++;
 
@@ -295,6 +314,12 @@ export class Orchestrator extends EventEmitter {
    * Core interrupt handler — separates media authority from generation authority.
    */
   private handleInterrupt(report?: InterruptPlaybackReport, playoutEpoch?: number): void {
+    const interruptedAgent = this.activeAgent;
+
+    // Drop active speaker before cancel so late response.done cannot chain another turn
+    this.activeAgent = null;
+    this.engagementTurnActive = false;
+
     // 1. Tell client to hard-flush playout queue (stale epoch frames dropped server-side too)
     this.emit("stopClientAudio", playoutEpoch ?? 0);
 
@@ -324,45 +349,45 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
-    const rollbackSummary = this.summarizeRollback(report);
+    const rollbackSummary = this.summarizeRollback(report, interruptedAgent);
 
     // 5. Roll back assistant conversation items the human never heard
     if (report) {
-      this.rollbackUnheardContext(report);
+      this.rollbackUnheardContext(report, interruptedAgent);
     } else {
       // No playback report — conservative: roll back all agents from this round
       for (const agentId of this.agentsCompletedThisRound) {
         const agent = this.findAgent(agentId);
         agent?.session.rollbackAssistantAudio("delete");
       }
-      if (this.activeAgent && !this.agentsCompletedThisRound.includes(this.activeAgent.id)) {
-        this.activeAgent.session.rollbackAssistantAudio("delete");
+      if (interruptedAgent && !this.agentsCompletedThisRound.includes(interruptedAgent.id)) {
+        interruptedAgent.session.rollbackAssistantAudio("delete");
       }
     }
 
     // 6. Clear round tracking and end any visible agent speaking state
-    if (this.activeAgent) {
-      this.emit("agentSpeakingEnd", this.activeAgent.id);
+    if (interruptedAgent) {
+      this.emit("agentSpeakingEnd", interruptedAgent.id);
       this.emit("systemEvent", `INTERRUPTED: playback flushed, context rolled back`);
     }
 
     this.recorder?.recordInterrupt({
       playoutEpoch: playoutEpoch ?? 0,
       interruptedBy: "human",
-      activeAgentId: this.activeAgent?.id ?? null,
-      activeAgentName: this.activeAgent?.name ?? null,
+      activeAgentId: interruptedAgent?.id ?? null,
+      activeAgentName: interruptedAgent?.name ?? null,
       playbackReport: report ?? null,
       rollback: rollbackSummary,
       agentsCompletedThisRound: [...this.agentsCompletedThisRound],
     });
 
     this.agentsCompletedThisRound = [];
-    this.activeAgent = null;
   }
 
   /** Compute rollback actions before they are applied — for session replay artifact. */
   private summarizeRollback(
-    report?: InterruptPlaybackReport
+    report?: InterruptPlaybackReport,
+    activeAgent: AgentRecord | null = this.activeAgent
   ): Array<{ agentId: string; agentName: string; mode: "delete" | "truncate"; audioEndMs?: number }> {
     const actions: Array<{
       agentId: string;
@@ -383,8 +408,8 @@ export class Orchestrator extends EventEmitter {
 
     if (!report) {
       for (const agentId of this.agentsCompletedThisRound) push(agentId, "delete");
-      if (this.activeAgent && !this.agentsCompletedThisRound.includes(this.activeAgent.id)) {
-        push(this.activeAgent.id, "delete");
+      if (activeAgent && !this.agentsCompletedThisRound.includes(activeAgent.id)) {
+        push(activeAgent.id, "delete");
       }
       return actions;
     }
@@ -403,11 +428,11 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
-    if (this.activeAgent && !this.agentsCompletedThisRound.includes(this.activeAgent.id)) {
-      if (report.partial?.agentId === this.activeAgent.id) {
-        push(this.activeAgent.id, "truncate", report.partial.audioEndMs);
+    if (activeAgent && !this.agentsCompletedThisRound.includes(activeAgent.id)) {
+      if (report.partial?.agentId === activeAgent.id) {
+        push(activeAgent.id, "truncate", report.partial.audioEndMs);
       } else {
-        push(this.activeAgent.id, "delete");
+        push(activeAgent.id, "delete");
       }
     }
 
@@ -417,7 +442,10 @@ export class Orchestrator extends EventEmitter {
   /**
    * Align each agent's OpenAI conversation with what the human actually heard.
    */
-  private rollbackUnheardContext(report: InterruptPlaybackReport): void {
+  private rollbackUnheardContext(
+    report: InterruptPlaybackReport,
+    activeAgent: AgentRecord | null
+  ): void {
     const heardSet = new Set(report.fullyHeard);
     if (report.partial) heardSet.add(report.partial.agentId);
 
@@ -444,11 +472,11 @@ export class Orchestrator extends EventEmitter {
     }
 
     // Agent still generating (not in completed list) — cancel already handled; delete partial item
-    if (this.activeAgent && !this.agentsCompletedThisRound.includes(this.activeAgent.id)) {
-      if (report.partial?.agentId === this.activeAgent.id) {
-        this.activeAgent.session.rollbackAssistantAudio("truncate", report.partial.audioEndMs);
+    if (activeAgent && !this.agentsCompletedThisRound.includes(activeAgent.id)) {
+      if (report.partial?.agentId === activeAgent.id) {
+        activeAgent.session.rollbackAssistantAudio("truncate", report.partial.audioEndMs);
       } else {
-        this.activeAgent.session.rollbackAssistantAudio("delete");
+        activeAgent.session.rollbackAssistantAudio("delete");
       }
     }
   }
@@ -488,10 +516,10 @@ export class Orchestrator extends EventEmitter {
 
     this.lastHumanTranscript = text;
     if (text?.trim()) {
-      this.appendConversationTurn("human", "human", HUMAN_NAME, text);
+      this.appendConversationTurn("human", "human", this.humanName, text);
       this.recorder?.recordTurn({
         speakerId: "human",
-        speaker: HUMAN_NAME,
+        speaker: this.humanName,
         role: "human",
         text: text.trim(),
       });
@@ -536,7 +564,7 @@ export class Orchestrator extends EventEmitter {
     speaker: string,
     text: string
   ): void {
-    const label = role === "human" ? HUMAN_NAME : speaker;
+    const label = role === "human" ? this.humanName : speaker;
 
     for (const agent of this.agents) {
       if (agent.session.state === "CLOSED") continue;
@@ -547,7 +575,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   private humanNamePattern(): string {
-    return `human|${HUMAN_NAME.toLowerCase()}`;
+    return `human|${this.humanName.toLowerCase()}`;
   }
 
   /**
@@ -571,12 +599,12 @@ export class Orchestrator extends EventEmitter {
 
     return (
       /\?/.test(lower) ||
-      new RegExp(`\\b(what|how|where|when|why)\\b[^.?!]{0,50}\\b(you|human|${HUMAN_NAME})\\b`, "i").test(
+      new RegExp(`\\b(what|how|where|when|why)\\b[^.?!]{0,50}\\b(you|human|${this.humanName})\\b`, "i").test(
         lower
       ) ||
       /\b(your turn|hear from you|like to hear from you|want your take)\b/i.test(lower) ||
       /\bwhat do you think\b/i.test(lower) ||
-      new RegExp(`\\b(tell me|ask)\\b[^.?!]{0,40}\\b(you|human|${HUMAN_NAME})\\b`, "i").test(lower)
+      new RegExp(`\\b(tell me|ask)\\b[^.?!]{0,40}\\b(you|human|${this.humanName})\\b`, "i").test(lower)
     );
   }
 
@@ -874,6 +902,7 @@ export class Orchestrator extends EventEmitter {
       this.emit("systemEvent", `GROQ: routing next speaker…`);
       const pick = await pickNextSpeakerWithGroq({
         apiKey: this.groqApiKey,
+        humanName: this.humanName,
         turns: this.conversationTurns,
         candidates: readyAgents.map((a) => ({ id: a.id, name: a.name })),
         lastSpeakerId: this.lastFinishedSpeakerId ?? undefined,
@@ -889,12 +918,12 @@ export class Orchestrator extends EventEmitter {
           this.recorder?.recordRouting({
             context: "chain",
             selectedSpeakerId: "human",
-            selectedSpeaker: HUMAN_NAME,
+            selectedSpeaker: this.humanName,
             source: "human_handoff",
             reason: pick.reason,
-            label: `GROQ: ${HUMAN_NAME}'s turn${pick.reason ? ` — ${pick.reason}` : ""}`,
+            label: `GROQ: ${this.humanName}'s turn${pick.reason ? ` — ${pick.reason}` : ""}`,
           });
-          this.emit("systemEvent", `GROQ: ${HUMAN_NAME}'s turn (${pick.reason ?? "natural pause"})`);
+          this.emit("systemEvent", `GROQ: ${this.humanName}'s turn (${pick.reason ?? "natural pause"})`);
           this.chainTurnCount = 0;
           this.activeAgent = null;
           this.transitionTo("IDLE", "groq human turn");
@@ -1013,7 +1042,7 @@ export class Orchestrator extends EventEmitter {
   private buildBaseTurnContext(agent: AgentRecord): string {
     return [
       `You are ${agent.name} at this table.`,
-      `Prior turns from ${HUMAN_NAME} and others are in your conversation history.`,
+      `Prior turns from ${this.humanName} and others are in your conversation history.`,
       "Never read instructions aloud. Never mention prompts, routing, or meta-rules about who you are.",
       "When recalling earlier speech, use conversation history — never claim you lack it.",
     ].join("\n\n");
@@ -1093,13 +1122,13 @@ export class Orchestrator extends EventEmitter {
     const topic = this.extractTopicFocus(text);
     const lines = [
       `## This turn`,
-      `CONTEXT: ${HUMAN_NAME} just said: "${text}"`,
+      `CONTEXT: ${this.humanName} just said: "${text}"`,
       `Give ${agent.name}'s reply in first person — your own view, not anyone else's voice.`,
     ];
 
     if (namedDirectly) {
       lines.push(
-        `${HUMAN_NAME} called on you by name. Acknowledge that briefly, then answer their question.`,
+        `${this.humanName} called on you by name. Acknowledge that briefly, then answer their question.`,
         topic
           ? `Stay on ${topic} — that is what they asked about.`
           : `Answer what they actually asked — no generic tangent.`,
@@ -1109,31 +1138,31 @@ export class Orchestrator extends EventEmitter {
       }
     } else {
       lines.push(
-        `Respond to ${HUMAN_NAME}'s point directly.`,
+        `Respond to ${this.humanName}'s point directly.`,
       );
     }
 
     if (this.asksAboutAnotherParticipant(text)) {
       lines.push(
-        `${HUMAN_NAME} is asking about someone else at this table. Describe them from the roster — as a co-participant you know, not by impersonating them.`,
-        `Do NOT say you lack information about table-mates or need ${HUMAN_NAME} to introduce them.`
+        `${this.humanName} is asking about someone else at this table. Describe them from the roster — as a co-participant you know, not by impersonating them.`,
+        `Do NOT say you lack information about table-mates or need ${this.humanName} to introduce them.`
       );
     }
 
     if (this.asksAboutMeetingRoster(text)) {
       lines.push(
-        `List all ${this.agents.length + 1} participants from the roster above (5 agents + ${HUMAN_NAME}). Briefly describe anyone ${HUMAN_NAME} asks about.`
+        `List all ${this.agents.length + 1} participants from the roster above (5 agents + ${this.humanName}). Briefly describe anyone ${this.humanName} asks about.`
       );
     }
 
     if (this.asksAboutConversationHistory(text)) {
       lines.push(
-        `${HUMAN_NAME} is asking about earlier conversation. Answer from your Realtime conversation history.`,
-        `Find the relevant turn(s), then quote or summarize them faithfully. Do NOT ask ${HUMAN_NAME} to repeat what is already in your history.`,
+        `${this.humanName} is asking about earlier conversation. Answer from your Realtime conversation history.`,
+        `Find the relevant turn(s), then quote or summarize them faithfully. Do NOT ask ${this.humanName} to repeat what is already in your history.`,
       );
       if (/\bfirst question\b/i.test(text)) {
         lines.push(
-          `Locate ${HUMAN_NAME}'s earliest line in the transcript — that is the first question. Include who answered and what they said next.`
+          `Locate ${this.humanName}'s earliest line in the transcript — that is the first question. Include who answered and what they said next.`
         );
       }
       if (/\b(repeat|what did .+ say|just (now )?said)\b/i.test(text)) {
@@ -1184,7 +1213,7 @@ export class Orchestrator extends EventEmitter {
     for (const [heard, actual] of Object.entries(Orchestrator.HUMAN_SPEAKER_HINTS)) {
       if (new RegExp(`\\b${heard}\\b`, "i").test(lower)) {
         hints.push(
-          `Name hint: when ${HUMAN_NAME} said "${heard}", they mean **${actual}** (conference participant) — check that speaker's lines in the transcript.`
+          `Name hint: when ${this.humanName} said "${heard}", they mean **${actual}** (conference participant) — check that speaker's lines in the transcript.`
         );
       }
     }
@@ -1223,7 +1252,7 @@ export class Orchestrator extends EventEmitter {
 
   private buildReplyToMeta(): TranscriptReplyToMeta | undefined {
     if (this.activeTurnContext === "human_turn") {
-      return { kind: "human", name: HUMAN_NAME };
+      return { kind: "human", name: this.humanName };
     }
     if (this.replyChainFromId) {
       const prev = this.findAgent(this.replyChainFromId);
@@ -1280,6 +1309,7 @@ export class Orchestrator extends EventEmitter {
     this.agentsCompletedThisRound.push(agentId);
     this.emit("agentSpeakingEnd", agentId);
     this.emit("systemEvent", `DONE: ${speaker?.name ?? agentId} finished`);
+    this.aiTurnsSinceHuman++;
 
     // Human named someone — they answer, then invite Human back (no chain).
     if (this.humanAddressedThisRound) {
@@ -1293,8 +1323,8 @@ export class Orchestrator extends EventEmitter {
     const addressee = transcript ? this.resolveSpeechAddressee(transcript, speaker) : { kind: "everyone" as const };
 
     if (addressee.kind === "human") {
-      logger.info("ORCHESTRATOR", `${speaker?.name ?? agentId} addressed ${HUMAN_NAME} — handoff after playout.`);
-      this.emit("systemEvent", `ADDRESSED: ${HUMAN_NAME} (${speaker?.name ?? agentId} asked them)`);
+      logger.info("ORCHESTRATOR", `${speaker?.name ?? agentId} addressed ${this.humanName} — handoff after playout.`);
+      this.emit("systemEvent", `ADDRESSED: ${this.humanName} (${speaker?.name ?? agentId} asked them)`);
       this.chainTurnCount = 0;
       this.activeAgent = null;
       this.transitionTo("IDLE", "agent asked human");
@@ -1321,6 +1351,28 @@ export class Orchestrator extends EventEmitter {
           ? "agent"
           : "everyone";
     const addresseeName = addressee.kind === "agent" ? addressee.agent.name : undefined;
+
+    if (this.aiTurnsSinceHuman >= this.maxAiTurnsBeforeHuman) {
+      logger.info(
+        "ORCHESTRATOR",
+        `AI turn threshold (${this.maxAiTurnsBeforeHuman}) reached — inviting human.`
+      );
+      this.emit("systemEvent", `THRESHOLD: ${this.maxAiTurnsBeforeHuman} AI turns — inviting human`);
+      this.recorder?.recordChain({
+        afterSpeakerId: agentId,
+        afterSpeaker: speaker?.name ?? agentId,
+        afterTranscript: transcript,
+        chainTurnCount: this.chainTurnCount,
+        addresseeKind,
+        addresseeName,
+        decision: "pause",
+        source: "fallback",
+        reason: `max AI turns (${this.maxAiTurnsBeforeHuman}) before human`,
+      });
+      this.chainTurnCount = 0;
+      this.beginEngagementQuestion(speaker);
+      return;
+    }
 
     if (this.chainTurnCount >= this.CHAIN_SAFETY_MAX) {
       logger.info("ORCHESTRATOR", `Chain safety cap (${this.CHAIN_SAFETY_MAX}) reached.`);
@@ -1352,6 +1404,7 @@ export class Orchestrator extends EventEmitter {
       if (this.groqApiKey) {
         const decision = await shouldContinueChainWithGroq({
           apiKey: this.groqApiKey,
+          humanName: this.humanName,
           turns: this.conversationTurns,
           chainTurnCount: this.chainTurnCount,
           lastSpeakerName: speaker?.name ?? agentId,
@@ -1450,9 +1503,9 @@ export class Orchestrator extends EventEmitter {
     agent.session.triggerResponse(
       this.composeTurnInstructions(
         agent,
-        `Ask ${HUMAN_NAME} one short, direct question that invites them to speak next — ` +
+        `Ask ${this.humanName} one short, direct question that invites them to speak next — ` +
           "something specific to what was just discussed. " +
-          `Address ${HUMAN_NAME} as "you" or "${HUMAN_NAME}" — never say "${agent.name}" as if you are talking to yourself. ` +
+          `Address ${this.humanName} as "you" or "${this.humanName}" — never say "${agent.name}" as if you are talking to yourself. ` +
           "Keep it conversational and under 12 seconds. Only your voice; no meta commentary.",
         { skipDissent: true }
       )

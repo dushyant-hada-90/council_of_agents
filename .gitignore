@@ -12,6 +12,8 @@ dist/
 sessions/
 logs/
 reports/
+.next
+.next/
 
 # Cache & temp
 .cache/

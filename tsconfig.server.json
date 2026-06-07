@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "incremental": false,
+    "plugins": []
+  },
+  "include": ["server.ts", "server/**/*", "lib/env.ts", "lib/auth/token.ts", "lib/auth/**/*", "lib/agents/**/*", "lib/types/**/*", "lib/supabase/admin.ts"],
+  "exclude": ["node_modules", "app", "components", "middleware.ts", "server/index.ts"]
+}

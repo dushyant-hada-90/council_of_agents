@@ -1,6 +1,5 @@
 import fs from "fs";
 import path from "path";
-import { HUMAN_NAME } from "../personalities/agents";
 import { InterruptPlaybackReport } from "./conferenceTypes";
 import { logger } from "./logger";
 
@@ -112,9 +111,9 @@ export class SessionRecorder {
     recorded: boolean;
   } | null = null;
 
-  constructor(agentMeta: Array<{ id: string; name: string }>) {
+  constructor(agentMeta: Array<{ id: string; name: string }>, humanName = "You") {
     this.participants = {
-      human: HUMAN_NAME,
+      human: humanName,
       agents: agentMeta.map((a) => ({ id: a.id, name: a.name })),
     };
   }

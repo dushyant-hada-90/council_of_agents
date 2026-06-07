@@ -1,4 +1,3 @@
-import { HUMAN_NAME } from "../personalities/agents";
 import { agentNamesMatch, findAgentByNameToken, normalizeAgentNameToken } from "./nameMatching";
 import { logger } from "./logger";
 
@@ -27,6 +26,7 @@ export type ChainContinueDecision =
 
 export interface PickNextSpeakerInput {
   apiKey: string;
+  humanName: string;
   turns: ConversationTurn[];
   candidates: Array<{ id: string; name: string }>;
   lastSpeakerId?: string;
@@ -37,6 +37,35 @@ export interface PickNextSpeakerInput {
   timeoutMs?: number;
 }
 
+export interface ShouldContinueChainInput {
+  apiKey: string;
+  humanName: string;
+  turns: ConversationTurn[];
+  chainTurnCount: number;
+  lastSpeakerName: string;
+  lastTranscript: string;
+  /** Who the last speaker addressed — affects whether the chain should keep going. */
+  addresseeKind: "human" | "everyone" | "agent";
+  addresseeName?: string;
+  timeoutMs?: number;
+}
+
+/** True when Groq picked the live human participant (by name, "human", or "you"). */
+function isHumanSpeakerPick(next: string, humanName: string): boolean {
+  const n = next.trim().toLowerCase();
+  if (!n || n === "random") return false;
+  if (n === "human" || n === "you") return true;
+
+  const human = humanName.trim().toLowerCase();
+  if (!human) return false;
+  if (n === human || human.includes(n) || n.includes(human)) return true;
+
+  const first = human.split(/\s+/)[0];
+  if (first && first.length >= 2 && n === first) return true;
+
+  return false;
+}
+
 /**
  * Ask Groq who should speak next based on conversational flow.
  * Returns { kind: "random" } on any failure — caller runs weighted lottery.
@@ -44,8 +73,9 @@ export interface PickNextSpeakerInput {
 export async function pickNextSpeakerWithGroq(
   input: PickNextSpeakerInput
 ): Promise<NextSpeakerPick> {
-  const { apiKey, turns, candidates, lastSpeakerId, recentSpeakerIds, context } = input;
+  const { apiKey, humanName, turns, candidates, lastSpeakerId, recentSpeakerIds, context } = input;
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const human = humanName.trim() || "You";
 
   if (!apiKey || candidates.length === 0) {
     return { source: "random", kind: "random" };
@@ -68,31 +98,29 @@ export async function pickNextSpeakerWithGroq(
     .map((t) => `${t.speaker}: ${t.text}`)
     .join("\n");
 
-  const humanName = HUMAN_NAME;
-
   const contextHint =
     context === "human_turn"
-      ? `${humanName} (the live human) just spoke. Pick which agent should respond to ${humanName}.`
+      ? `${human} (the live human) just spoke. Pick which agent should respond to ${human}.`
       : "An agent just finished. Pick who should speak next in the natural back-and-forth.";
 
   const system = `You are the turn-taking router for a live voice conference.
 ${contextHint}
 
 Agents (use exact first names): ${agentNames}
-Also present: ${humanName} (live human with push-to-talk).
+Also present: ${human} (live human with push-to-talk).
 
 Rules:
 ${recentHint ? `- ${recentHint}` : ""}
 - Pick who should SPEAK next — not who is being discussed. "I'd like to hear from Vikram about Priya" → Vikram speaks, not Priya.
 - "hear from X", "turn to X", "I want X's take" → X should speak even if other names appear as the topic.
 - A name mentioned only as the subject ("what do you think about Priya") is NOT the speaker unless they were invited to respond.
-- If the last line was from ${humanName}, pick the agent ${humanName} is clearly inviting to respond.
+- If the last line was from ${human}, pick the agent ${human} is clearly inviting to respond.
 - If the floor is open with no invite, pick who would naturally jump in (expertise, disagreement, emotional reaction).
 - The same agent may speak twice in a row when finishing an answer, clarifying, or responding to a follow-up aimed at them — pick them if that is the natural next turn.
-- Pick "${humanName}" only if the last speaker asked ${humanName} a direct question and it is their turn to reply.
+- Pick "${human}" or "human" only if the last speaker asked ${human} a direct question and it is their turn to reply.
 - Pick "random" only when the floor is genuinely open with no natural next speaker.
 
-Reply with JSON only: {"next":"<AgentFirstName|${humanName}|random>","reason":"<max 12 words>"}`;
+Reply with JSON only: {"next":"<AgentFirstName|${human}|human|random>","reason":"<max 12 words>"}`;
 
   const user = [
     `Conversation so far:\n${recent || "(session just started)"}`,
@@ -146,8 +174,8 @@ Reply with JSON only: {"next":"<AgentFirstName|${humanName}|random>","reason":"<
       return { source: "random", kind: "random" };
     }
 
-    if (/^(human|dushyant)$/i.test(next)) {
-      logger.info("GROQ", `Router → ${humanName} (${reason ?? ""})`);
+    if (isHumanSpeakerPick(next, human)) {
+      logger.info("GROQ", `Router → ${human} (${reason ?? ""})`);
       return { source: "groq", kind: "human", reason };
     }
 
@@ -196,18 +224,6 @@ Reply with JSON only: {"next":"<AgentFirstName|${humanName}|random>","reason":"<
   }
 }
 
-export interface ShouldContinueChainInput {
-  apiKey: string;
-  turns: ConversationTurn[];
-  chainTurnCount: number;
-  lastSpeakerName: string;
-  lastTranscript: string;
-  /** Who the last speaker addressed — affects whether the chain should keep going. */
-  addresseeKind: "human" | "everyone" | "agent";
-  addresseeName?: string;
-  timeoutMs?: number;
-}
-
 /**
  * Ask Groq whether agent-to-agent chain reactions should continue.
  * Replaces a fixed turn cap — heated debates may run longer; factual Q&A may stop sooner.
@@ -217,6 +233,7 @@ export async function shouldContinueChainWithGroq(
 ): Promise<ChainContinueDecision> {
   const {
     apiKey,
+    humanName,
     turns,
     chainTurnCount,
     lastSpeakerName,
@@ -224,6 +241,7 @@ export async function shouldContinueChainWithGroq(
     addresseeKind,
     addresseeName,
   } = input;
+  const human = humanName.trim() || "You";
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   if (!apiKey) {
@@ -240,7 +258,7 @@ export async function shouldContinueChainWithGroq(
       ? `${lastSpeakerName} directly addressed ${addresseeName} — the chain likely continues.`
       : addresseeKind === "everyone"
         ? `${lastSpeakerName} spoke to the open table.`
-        : `${lastSpeakerName} asked ${HUMAN_NAME} a question.`;
+        : `${lastSpeakerName} asked ${human} a question.`;
 
   const system = `You decide whether a live voice conference should allow another agent-to-agent reaction turn.
 
@@ -256,7 +274,7 @@ Stop the chain (return continue=false) when:
 - The point feels naturally settled or acknowledged
 - The exchange was a simple factual answer with nothing to push back on
 - Agents are starting to repeat themselves
-- It is time to invite ${HUMAN_NAME} back into the conversation
+- It is time to invite ${human} back into the conversation
 
 Reply with JSON only: {"continue":true|false,"reason":"<max 12 words>"}`;
 

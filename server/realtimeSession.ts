@@ -1,6 +1,8 @@
 import WebSocket from "ws";
 import { EventEmitter } from "events";
-import { AgentConfig, buildMeetingRoster } from "../personalities/agents";
+import type { AgentConfig } from "../lib/agents/types";
+import { normalizeVoice } from "../lib/agents/types";
+import { buildMeetingRoster } from "../lib/agents/roster";
 import { logger } from "./logger";
 
 // ─── OpenAI Realtime GA API types (partial) ──────────────────────────────────
@@ -176,11 +178,27 @@ export class RealtimeSession extends EventEmitter {
   private pendingInputAudioBytes = 0;
   private static readonly MIN_COMMIT_BYTES = PCM16_BYTES_PER_MS * 100;
 
-  constructor(config: AgentConfig, apiKey: string) {
+  private readonly allAgents: AgentConfig[];
+  private readonly humanName: string;
+
+  private readonly voice: AgentConfig["voice"];
+
+  constructor(
+    config: AgentConfig,
+    apiKey: string,
+    allAgents: AgentConfig[],
+    humanName = "You"
+  ) {
     super();
     this.config = config;
     this.agentId = config.id;
     this.apiKey = apiKey;
+    this.allAgents = allAgents;
+    this.humanName = humanName;
+    this.voice = normalizeVoice(config.voice);
+    if (this.voice !== config.voice) {
+      logger.warn("SESSION", `${config.id} — voice "${config.voice}" mapped to "${this.voice}"`);
+    }
   }
 
   // ─── Public lifecycle ───────────────────────────────────────────────────────
@@ -332,9 +350,11 @@ export class RealtimeSession extends EventEmitter {
    * Force-cancel even if state is uncertain (used during human interrupt).
    */
   public forceCancelResponse(): void {
-    if (this.state === "SPEAKING") {
-      this.cancelResponse();
-    }
+    if (this.state !== "SPEAKING") return;
+    logger.wsEvent("SENT", this.agentId, "response.cancel (force)");
+    this.sendEvent({ type: "response.cancel" });
+    this.state = "READY";
+    this.resetCurrentResponseTracking();
   }
 
   /**
@@ -419,7 +439,7 @@ export class RealtimeSession extends EventEmitter {
       session: {
         type: "realtime",
         model: DEFAULT_REALTIME_MODEL,
-        instructions: `${this.config.systemPrompt}\n\n${buildMeetingRoster()}`,
+        instructions: `${this.config.systemPrompt}\n\n${buildMeetingRoster(this.humanName, this.allAgents)}`,
         output_modalities: ["audio"],
         audio: {
           input: {
@@ -429,7 +449,7 @@ export class RealtimeSession extends EventEmitter {
           },
           output: {
             format: { type: "audio/pcm", rate: 24000 },
-            voice: this.config.voice,
+            voice: this.voice,
           },
         },
       },
@@ -437,7 +457,7 @@ export class RealtimeSession extends EventEmitter {
 
     this.sendRaw(JSON.stringify(sessionUpdate));
     logger.wsEvent("SENT", this.agentId, "session.update", {
-      voice: this.config.voice,
+      voice: this.voice,
       turn_detection: null,
       api: "GA",
     });
@@ -462,7 +482,7 @@ export class RealtimeSession extends EventEmitter {
         this.state = "READY";
         this.emit("ready");
         this.flushPendingEvents();
-        logger.info("SESSION", `${this.agentId} — session READY (voice: ${this.config.voice})`);
+        logger.info("SESSION", `${this.agentId} — session READY (voice: ${this.voice})`);
         break;
 
       // GA event names (with beta fallbacks for safety)
@@ -507,12 +527,20 @@ export class RealtimeSession extends EventEmitter {
             this.lastCompletedTranscript = this.currentTranscriptText;
           }
         }
+        this.resetCurrentResponseTracking();
         this.emit("responseDone", status, this.agentId);
         break;
       }
 
       case "error": {
         const e = event as unknown as OpenAIErrorEvent;
+        if (e.error.code === "response_cancel_not_active") {
+          logger.debug(
+            "SESSION",
+            `${this.agentId} — cancel skipped (no active response)`
+          );
+          break;
+        }
         const err = new Error(`OpenAI error [${e.error.code}]: ${e.error.message}`);
         logger.error("SESSION", `${this.agentId} — OpenAI error`, e.error);
         this.emit("error", err, this.agentId);
