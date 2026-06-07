@@ -9,7 +9,13 @@ import {
   hasQueuedAudioAfter,
 } from "@/lib/meeting/playoutClock";
 
-const SAMPLE_RATE = 24000;
+import {
+  CAPTURE_SAMPLE_RATE,
+  downsampleFloat32,
+  float32ToPcm16,
+} from "@/lib/meeting/audioCapture";
+
+const SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
 const PLAYBACK_BUFFER_AHEAD_S = 0.05;
 
 interface AgentMeta {
@@ -179,6 +185,7 @@ export function MeetingRoom({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const captureSampleRateRef = useRef(SAMPLE_RATE);
   const nextPlayTimeRef = useRef(0);
   const playoutEpochRef = useRef(0);
   const playoutBlockedRef = useRef(false);
@@ -567,19 +574,37 @@ export function MeetingRoom({
 
   async function initAudio() {
     audioCtxRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    captureSampleRateRef.current = audioCtxRef.current.sampleRate;
+    if (captureSampleRateRef.current !== SAMPLE_RATE) {
+      console.warn(
+        `[MeetingRoom] AudioContext sampleRate=${captureSampleRateRef.current}Hz (requested ${SAMPLE_RATE}Hz) — resampling mic to ${SAMPLE_RATE}Hz before STT`
+      );
+    }
+    // Request mono audio with noise/echo processing to improve STT accuracy
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: { ideal: 1 },
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: { ideal: SAMPLE_RATE },
+      },
+    });
     micStreamRef.current = stream;
     const source = audioCtxRef.current.createMediaStreamSource(stream);
+    // bufferSize=4096, inputChannels=1, outputChannels=1 — always mono
     const processor = audioCtxRef.current.createScriptProcessor(4096, 1, 1);
     scriptProcessorRef.current = processor;
 
     processor.onaudioprocess = (e) => {
       if (!isPTTActiveRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
       const input = e.inputBuffer.getChannelData(0);
-      const pcm16 = new Int16Array(input.length);
-      for (let i = 0; i < input.length; i++) {
-        pcm16[i] = Math.max(-32768, Math.min(32767, input[i]! * 32768));
-      }
+      const captureRate = captureSampleRateRef.current;
+      const samples =
+        captureRate === SAMPLE_RATE
+          ? input
+          : downsampleFloat32(input, captureRate, SAMPLE_RATE);
+      const pcm16 = float32ToPcm16(samples);
       wsRef.current.send(pcm16.buffer);
     };
 
@@ -614,7 +639,12 @@ export function MeetingRoom({
     if (!isPTTActiveRef.current) return;
     isPTTActiveRef.current = false;
     setIsPTTActive(false);
-    wsRef.current?.send(JSON.stringify({ type: "END_SPEECH" }));
+    wsRef.current?.send(
+      JSON.stringify({
+        type: "END_SPEECH",
+        captureSampleRate: captureSampleRateRef.current,
+      })
+    );
   }
 
   useEffect(() => {

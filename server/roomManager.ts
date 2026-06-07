@@ -425,7 +425,9 @@ export class ConferenceRoom {
         }
 
         this.sessionRecorder.markSttSubmit();
-        void resolveHumanTranscript(chunks)
+        const captureSampleRate =
+          typeof event.captureSampleRate === "number" ? event.captureSampleRate : undefined;
+        void resolveHumanTranscript(chunks, { captureSampleRate })
           .then((result) => {
             this.humanTranscriptStatus = result.meta.detail;
             this.sessionRecorder.markSttResult(

@@ -1,12 +1,15 @@
 import { TextToSpeechClient } from "@google-cloud/text-to-speech";
 import { normalizeGoogleVoice } from "../../lib/agents/types";
+import { getEnv } from "../../lib/env";
 import { logger } from "../logger";
+import { stripWavHeaderIfPresent } from "./wav";
 
 let client: TextToSpeechClient | null = null;
 
 function getClient(): TextToSpeechClient {
   if (!client) {
-    client = new TextToSpeechClient();
+    const { GOOGLE_APPLICATION_CREDENTIALS } = getEnv();
+    client = new TextToSpeechClient({ keyFilename: GOOGLE_APPLICATION_CREDENTIALS });
   }
   return client;
 }
@@ -19,7 +22,8 @@ export interface SynthesizeOptions {
 }
 
 /**
- * Synthesize speech to PCM16 mono at 24kHz using Google Cloud TTS.
+ * Synthesize speech to raw PCM16 mono at 24kHz using Google Cloud TTS.
+ * Strips the WAV header Google returns with LINEAR16 encoding.
  */
 export async function synthesizeSpeech(
   text: string,
@@ -45,7 +49,7 @@ export async function synthesizeSpeech(
     });
 
     const content = response.audioContent;
-    if (!content || !(content instanceof Uint8Array) && typeof content !== "string") {
+    if (!content || (!(content instanceof Uint8Array) && typeof content !== "string")) {
       return Buffer.alloc(0);
     }
 
@@ -53,8 +57,16 @@ export async function synthesizeSpeech(
       ? content
       : Buffer.from(content as string | Uint8Array);
 
-    logger.info("TTS", `Synthesized ${buf.byteLength} bytes for voice ${voiceName}`);
-    return buf;
+    const { pcm, hadWavHeader } = stripWavHeaderIfPresent(buf);
+    if (hadWavHeader) {
+      logger.info(
+        "TTS",
+        `Stripped WAV header (${buf.byteLength - pcm.byteLength} bytes) → raw PCM ${pcm.byteLength} bytes for ${voiceName}`
+      );
+    } else {
+      logger.info("TTS", `Synthesized ${pcm.byteLength} bytes raw PCM for voice ${voiceName}`);
+    }
+    return pcm;
   } catch (err) {
     logger.error("TTS", `Google TTS failed: ${(err as Error).message}`);
     throw err;
