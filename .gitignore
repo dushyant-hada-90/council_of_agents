@@ -19,6 +19,7 @@ reports/
 .cache/
 temp/
 *.tmp
+tsconfig.tsbuildinfo
 
 # OS
 .DS_Store

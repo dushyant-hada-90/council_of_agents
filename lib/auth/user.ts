@@ -1,5 +1,6 @@
 import { getSession } from "@/lib/auth/session";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
+import { redirect } from "next/navigation";
 
 export interface AppUser {
   id: string;
@@ -29,5 +30,13 @@ export async function getUser(): Promise<AppUser | null> {
 export async function requireUser(): Promise<AppUser> {
   const user = await getUser();
   if (!user) throw new Error("Unauthorized");
+  return user;
+}
+
+export async function requireUserOrRedirect(
+  redirectTo = "/login"
+): Promise<AppUser> {
+  const user = await getUser();
+  if (!user) redirect(redirectTo);
   return user;
 }

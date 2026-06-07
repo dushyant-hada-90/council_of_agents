@@ -1,5 +1,5 @@
 /**
- * Normalize agent first-name tokens for routing (Whisper/Groq spelling variants).
+ * Normalize agent first-name tokens for routing (STT spelling variants).
  * Only applies safe canonical mappings — not blind trailing-h stripping (Rohan ≠ Roan).
  */
 const CANONICAL_STRIP_H = new Set(["sara", "sarah", "sarahh", "sera", "farah"]);

@@ -1,14 +1,14 @@
 import { notFound } from "next/navigation";
 import { AppShell } from "@/components/AppShell";
 import { AgentForm } from "@/components/AgentForm";
-import { requireUser, getDb } from "@/lib/supabase/server";
+import { requireUserOrRedirect, getDb } from "@/lib/supabase/server";
 import type { AgentRow } from "@/lib/types/database";
 
 type Props = { params: Promise<{ id: string }> };
 
 export default async function EditAgentPage({ params }: Props) {
   const { id } = await params;
-  const user = await requireUser();
+  const user = await requireUserOrRedirect(`/login?redirect=/agents/${id}/edit`);
   const db = getDb();
 
   const { data } = await db

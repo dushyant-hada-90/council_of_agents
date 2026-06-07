@@ -1,9 +1,9 @@
 import Link from "next/link";
 import { AppShell } from "@/components/AppShell";
-import { requireUser, getDb } from "@/lib/supabase/server";
+import { requireUserOrRedirect, getDb } from "@/lib/supabase/server";
 
 export default async function DashboardPage() {
-  const user = await requireUser();
+  const user = await requireUserOrRedirect("/login?redirect=/dashboard");
   const db = getDb();
 
   const [agentsRes, meetingsRes, transcriptCountRes] = await Promise.all([

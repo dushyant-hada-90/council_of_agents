@@ -1,5 +1,5 @@
 import { EventEmitter } from "events";
-import { RealtimeSession } from "./realtimeSession";
+import { AgentSession } from "./agentSession";
 import { AudioMixer } from "./audioMixer";
 import { logger } from "./logger";
 import type { MaxAiTurnsBeforeHuman } from "../lib/agents/types";
@@ -8,8 +8,8 @@ import { agentNamesMatch, normalizeAgentNameToken } from "./nameMatching";
 import { SessionRecorder } from "./sessionRecorder";
 import {
   ConversationTurn,
-  pickNextSpeakerWithGroq,
-  shouldContinueChainWithGroq,
+  pickSpeakerAndRespondWithGemini,
+  shouldContinueChainWithGemini,
 } from "./nextSpeakerRouter";
 
 // ─── FSM State definitions ────────────────────────────────────────────────────
@@ -70,7 +70,8 @@ export type OrchestratorEvents = {
 interface AgentRecord {
   id: string;
   name: string;
-  session: RealtimeSession;
+  session: AgentSession;
+  systemPrompt: string;
   /** Higher weight = more likely to be selected. Starts at 1.0. */
   selectionWeight: number;
   /** Unix timestamp of when this agent last finished speaking. 0 = never. */
@@ -109,7 +110,7 @@ export class Orchestrator extends EventEmitter {
   private readonly SILENCE_TIMEOUT_MS = 500;
 
   /**
-   * Fallback probability when Groq is unavailable for chain continuation decisions.
+   * Fallback probability when Gemini is unavailable for chain continuation decisions.
    * The FIRST reaction after a human turn is always guaranteed.
    */
   private readonly CHAIN_REACTION_PROBABILITY = 0.80;
@@ -119,7 +120,7 @@ export class Orchestrator extends EventEmitter {
    */
   private readonly CHAIN_REACTION_DELAY_MS = 900;
 
-  /** Hard backstop — Groq normally decides when chains end; this prevents runaway loops. */
+  /** Hard backstop — Gemini normally decides when chains end; this prevents runaway loops. */
   private readonly CHAIN_SAFETY_MAX = 12;
 
   /** How many agent-to-agent turns have happened in the current chain. */
@@ -151,15 +152,15 @@ export class Orchestrator extends EventEmitter {
   /** Follow-up turn where the last speaker asks the Human an engaging question. */
   private engagementTurnActive = false;
 
-  /** Rolling transcript for Groq turn-taking (trimmed). */
+  /** Rolling transcript for Gemini turn-taking (trimmed). */
   private conversationTurns: ConversationTurn[] = [];
   private readonly MAX_CONVERSATION_TURNS = 24;
 
-  /** Last agent who finished a turn — Groq should not re-pick unless asked. */
+  /** Last agent who finished a turn — router should not re-pick unless asked. */
   private lastFinishedSpeakerId: string | null = null;
 
-  /** Groq API key for LLM routing; undefined → weighted random only. */
-  private readonly groqApiKey: string | undefined;
+  /** Gemini router for next speaker (merged pick + response). */
+  private readonly routingEnabled: boolean;
 
   /** Structured session replay artifact collector. */
   private readonly recorder: SessionRecorder | null;
@@ -173,7 +174,7 @@ export class Orchestrator extends EventEmitter {
   /** Agent turns since human last spoke (excluding engagement). */
   private aiTurnsSinceHuman = 0;
 
-  /** Bumped on interrupt so stale async Groq picks are ignored. */
+  /** Bumped on interrupt so stale async Gemini picks are ignored. */
   private selectionGeneration = 0;
 
   /** Whether the in-flight agent turn is replying to the human or continuing a chain. */
@@ -213,28 +214,26 @@ export class Orchestrator extends EventEmitter {
 
   constructor(
     mixer: AudioMixer,
-    groqApiKey?: string,
     recorder?: SessionRecorder,
     options?: { humanName?: string; maxAiTurnsBeforeHuman?: MaxAiTurnsBeforeHuman }
   ) {
     super();
     this.mixer = mixer;
-    this.groqApiKey = groqApiKey?.trim() || undefined;
+    this.routingEnabled = true;
     this.recorder = recorder ?? null;
     this.humanName = options?.humanName ?? "You";
     this.maxAiTurnsBeforeHuman = options?.maxAiTurnsBeforeHuman ?? 4;
-    if (this.groqApiKey) {
-      logger.info("ORCHESTRATOR", "Groq next-speaker router enabled");
-    }
+    logger.info("ORCHESTRATOR", "Gemini next-speaker router enabled");
   }
 
   // ─── Agent registration ─────────────────────────────────────────────────────
 
-  public registerAgent(session: RealtimeSession, name: string): void {
+  public registerAgent(session: AgentSession, name: string, systemPrompt = ""): void {
     const record: AgentRecord = {
       id: session.agentId,
       name,
       session,
+      systemPrompt,
       selectionWeight: 1.0,
       lastSpokAt: 0,
       speakCount: 0,
@@ -440,7 +439,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Align each agent's OpenAI conversation with what the human actually heard.
+   * Align each agent's conversation history with what the human actually heard.
    */
   private rollbackUnheardContext(
     report: InterruptPlaybackReport,
@@ -506,7 +505,7 @@ export class Orchestrator extends EventEmitter {
 
   /**
    * Called when Whisper returns the human's utterance.
-   * Appends the utterance to conversation history; Groq routes the next speaker.
+   * Appends the utterance to conversation history; Gemini routes the next speaker.
    */
   public onHumanTranscript(text: string | null): void {
     if (!this.awaitingHumanTranscript || this.state !== "DECIDING") return;
@@ -555,7 +554,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Mirror each spoken turn into every agent's Realtime conversation via
+   * Mirror each spoken turn into every agent's session history via
    * conversation.item.create. Mix-minus audio is live acoustics; this is durable memory.
    */
   private syncTurnToPeerSessions(
@@ -785,7 +784,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Fallback when Groq is unavailable: pick who the human invited to speak.
+   * Fallback when Gemini is unavailable: pick who the human invited to speak.
    * Distinguishes "hear from Vikram about Priya" (Vikram) from "about Priya" alone.
    */
   private resolveHumanAddressee(text: string): AgentRecord | null {
@@ -841,7 +840,7 @@ export class Orchestrator extends EventEmitter {
     return this.recentAgentSpeakerIds.includes(agentId);
   }
 
-  /** Weighted-random fallback when Groq is unavailable or returns "random". */
+  /** Weighted-random fallback when Gemini is unavailable or returns "random". */
   private pickWeightedRandom(pool: AgentRecord[]): AgentRecord {
     const weights = pool.map((agent) => {
       if (this.isOnSpeakerCooldown(agent.id)) return 0;
@@ -872,7 +871,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Pick the next speaker: Groq router → name-match fallback → weighted random.
+   * Pick the next speaker: Gemini merged turn → name-match fallback → weighted random.
    */
   private async selectAndTriggerAgent(
     selectionContext: "human_turn" | "chain" = "human_turn"
@@ -896,70 +895,66 @@ export class Orchestrator extends EventEmitter {
     let selectedAgent: AgentRecord | null = null;
     let selectionLabel = "";
     let usedNamedFallback = false;
-    let groqPickReason: string | undefined;
+    let geminiPickReason: string | undefined;
+    let preGeneratedText: string | undefined;
 
-    if (this.groqApiKey) {
-      this.emit("systemEvent", `GROQ: routing next speaker…`);
-      const pick = await pickNextSpeakerWithGroq({
-        apiKey: this.groqApiKey,
+    // Human named someone — skip merged routing; use a single response-only call.
+    if (selectionContext === "human_turn" && this.lastHumanTranscript) {
+      const named = this.resolveHumanAddressee(this.lastHumanTranscript);
+      if (named && readyAgents.some((a) => a.id === named.id)) {
+        selectedAgent = named;
+        selectionLabel = `NAMED: ${named.name} (human addressed)`;
+        usedNamedFallback = true;
+      }
+    }
+
+    if (!selectedAgent && this.routingEnabled) {
+      this.emit("systemEvent", `GEMINI: routing + generating response…`);
+      const pick = await pickSpeakerAndRespondWithGemini({
         humanName: this.humanName,
         turns: this.conversationTurns,
-        candidates: readyAgents.map((a) => ({ id: a.id, name: a.name })),
+        candidates: readyAgents.map((a) => ({
+          id: a.id,
+          name: a.name,
+          systemPrompt: a.systemPrompt,
+        })),
         lastSpeakerId: this.lastFinishedSpeakerId ?? undefined,
         recentSpeakerIds: this.recentAgentSpeakerIds,
         context: selectionContext,
+        scenarioHint: this.buildMergedTurnGuidance(selectionContext),
       });
 
       if (generation !== this.selectionGeneration) return;
 
-      if (pick.source === "groq" && pick.kind === "human") {
+      if (pick.source === "gemini" && pick.kind === "human") {
         if (selectionContext === "chain") {
-          logger.info("ORCHESTRATOR", "Groq routed to Human — inviting human to speak.");
+          logger.info("ORCHESTRATOR", "Gemini routed to Human — inviting human to speak.");
           this.recorder?.recordRouting({
             context: "chain",
             selectedSpeakerId: "human",
             selectedSpeaker: this.humanName,
             source: "human_handoff",
             reason: pick.reason,
-            label: `GROQ: ${this.humanName}'s turn${pick.reason ? ` — ${pick.reason}` : ""}`,
+            label: `GEMINI: ${this.humanName}'s turn${pick.reason ? ` — ${pick.reason}` : ""}`,
           });
-          this.emit("systemEvent", `GROQ: ${this.humanName}'s turn (${pick.reason ?? "natural pause"})`);
+          this.emit("systemEvent", `GEMINI: ${this.humanName}'s turn (${pick.reason ?? "natural pause"})`);
           this.chainTurnCount = 0;
           this.activeAgent = null;
-          this.transitionTo("IDLE", "groq human turn");
+          this.transitionTo("IDLE", "gemini human turn");
           this.emit("humanTurnReady");
           this.lastHumanTranscript = null;
           return;
         }
-        // Human just spoke — still need an agent reply; fall through to random.
-        logger.warn("ORCHESTRATOR", "Groq said Human after human spoke — using random agent.");
+        logger.warn("ORCHESTRATOR", "Gemini said Human after human spoke — using random agent.");
       }
 
-      if (pick.source === "groq" && pick.kind === "agent") {
+      if (pick.source === "gemini" && pick.kind === "agent") {
         const agent = this.findAgent(pick.agentId);
         if (agent && readyAgents.some((a) => a.id === agent.id)) {
           selectedAgent = agent;
-          groqPickReason = pick.reason;
-          selectionLabel = `GROQ: ${agent.name}${pick.reason ? ` — ${pick.reason}` : ""}`;
-        }
-      }
-    }
-
-    // Human named someone — always override Groq/random (fixes Sarah→Sara, Groq misroutes).
-    if (selectionContext === "human_turn" && this.lastHumanTranscript) {
-      const named = this.resolveHumanAddressee(this.lastHumanTranscript);
-      if (named && readyAgents.some((a) => a.id === named.id)) {
-        if (!selectedAgent || selectedAgent.id !== named.id) {
-          if (selectedAgent) {
-            logger.info(
-              "ORCHESTRATOR",
-              `Human named ${named.name} — overriding ${selectedAgent.name}`
-            );
-          }
-          selectedAgent = named;
-          selectionLabel = `NAMED: ${named.name} (human addressed)`;
-          usedNamedFallback = true;
-          groqPickReason = undefined;
+          geminiPickReason = pick.reason;
+          preGeneratedText = pick.response;
+          selectionLabel = `GEMINI: ${agent.name}${pick.reason ? ` — ${pick.reason}` : ""}`;
         }
       }
     }
@@ -974,8 +969,8 @@ export class Orchestrator extends EventEmitter {
     logger.info("ORCHESTRATOR", `Selected agent: ${selectedAgent.name}`);
     this.emit("systemEvent", `SELECTED: ${selectionLabel}`);
 
-    const routingSource = selectionLabel.startsWith("GROQ:")
-      ? "groq"
+    const routingSource = selectionLabel.startsWith("GEMINI:")
+      ? "gemini"
       : selectionLabel.startsWith("NAMED:")
         ? "named_fallback"
         : "random";
@@ -984,7 +979,7 @@ export class Orchestrator extends EventEmitter {
       selectedSpeakerId: selectedAgent.id,
       selectedSpeaker: selectedAgent.name,
       source: routingSource,
-      reason: groqPickReason,
+      reason: geminiPickReason,
       label: selectionLabel,
     });
 
@@ -1004,7 +999,7 @@ export class Orchestrator extends EventEmitter {
         selectedAgent,
         humanLine,
         this.isDirectlyAddressed(humanLine, selectedAgent),
-        groqPickReason
+        geminiPickReason
       );
     } else if (selectionContext === "chain") {
       const fromSpeaker = this.lastFinishedSpeakerId
@@ -1031,11 +1026,64 @@ export class Orchestrator extends EventEmitter {
 
     this.triggerAgentSpeech(
       selectedAgent,
-      turnInstructions
-        ? this.composeTurnInstructions(selectedAgent, turnInstructions, { skipDissent })
-        : this.composeTurnInstructions(selectedAgent, undefined, { skipDissent }),
-      selectionContext
+      preGeneratedText
+        ? undefined
+        : turnInstructions
+          ? this.composeTurnInstructions(selectedAgent, turnInstructions, { skipDissent })
+          : this.composeTurnInstructions(selectedAgent, undefined, { skipDissent }),
+      selectionContext,
+      preGeneratedText
     );
+  }
+
+  private buildMergedTurnGuidance(selectionContext: "human_turn" | "chain"): string {
+    const lines: string[] = [];
+
+    if (selectionContext === "human_turn" && this.lastHumanTranscript) {
+      const text = this.lastHumanTranscript;
+      lines.push(`${this.humanName} just said: "${text}"`);
+      for (const hint of this.humanSpeakerNameHints(text)) {
+        lines.push(hint);
+      }
+      if (this.asksAboutAnotherParticipant(text)) {
+        lines.push(
+          `${this.humanName} is asking about someone else at this table — answer from the roster, not by impersonating them.`
+        );
+      }
+      if (this.asksAboutMeetingRoster(text)) {
+        lines.push(
+          `List all ${this.agents.length + 1} participants from the roster when relevant.`
+        );
+      }
+      if (this.asksAboutConversationHistory(text)) {
+        lines.push(
+          `${this.humanName} is asking about earlier conversation — use the transcript faithfully.`
+        );
+      }
+    } else if (selectionContext === "chain") {
+      const fromSpeaker = this.lastFinishedSpeakerId
+        ? this.findAgent(this.lastFinishedSpeakerId)
+        : undefined;
+      const fromText = fromSpeaker?.session.getLastTranscript() ?? "";
+      if (fromSpeaker && fromText) {
+        lines.push(`${fromSpeaker.name} just said: "${fromText}"`);
+        const addressee = this.resolveSpeechAddressee(fromText, fromSpeaker);
+        if (addressee.kind === "agent") {
+          lines.push(`${fromSpeaker.name} addressed ${addressee.agent.name} directly.`);
+        } else if (addressee.kind === "human") {
+          lines.push(`${fromSpeaker.name} asked ${this.humanName} a question.`);
+        }
+      }
+    }
+
+    const summary = this.extractConsensusSummary();
+    if (summary) {
+      lines.push(
+        "Recent lines suggest the table may be converging — if you pick an agent, they may push back with a fresh angle."
+      );
+    }
+
+    return lines.join("\n");
   }
 
   /** Prepended to every response.create — identity only; roster lives in session instructions. */
@@ -1117,7 +1165,7 @@ export class Orchestrator extends EventEmitter {
     agent: AgentRecord,
     text: string,
     namedDirectly: boolean,
-    groqReason?: string
+    routingReason?: string
   ): string {
     const topic = this.extractTopicFocus(text);
     const lines = [
@@ -1133,8 +1181,8 @@ export class Orchestrator extends EventEmitter {
           ? `Stay on ${topic} — that is what they asked about.`
           : `Answer what they actually asked — no generic tangent.`,
       );
-      if (groqReason) {
-        lines.push(`(Internal note: ${groqReason})`);
+      if (routingReason) {
+        lines.push(`(Internal note: ${routingReason})`);
       }
     } else {
       lines.push(
@@ -1157,7 +1205,7 @@ export class Orchestrator extends EventEmitter {
 
     if (this.asksAboutConversationHistory(text)) {
       lines.push(
-        `${this.humanName} is asking about earlier conversation. Answer from your Realtime conversation history.`,
+        `${this.humanName} is asking about earlier conversation. Answer from your conversation history.`,
         `Find the relevant turn(s), then quote or summarize them faithfully. Do NOT ask ${this.humanName} to repeat what is already in your history.`,
       );
       if (/\bfirst question\b/i.test(text)) {
@@ -1264,7 +1312,8 @@ export class Orchestrator extends EventEmitter {
   private triggerAgentSpeech(
     agent: AgentRecord,
     extraInstructions?: string,
-    turnContext: "human_turn" | "chain" = "chain"
+    turnContext: "human_turn" | "chain" = "chain",
+    preGeneratedText?: string
   ): void {
     this.activeTurnContext = turnContext;
     this.replyChainFromId = turnContext === "chain" ? this.lastFinishedSpeakerId : null;
@@ -1284,7 +1333,8 @@ export class Orchestrator extends EventEmitter {
 
     logger.startTimer(`turn_latency_${agent.id}_${agent.speakCount}`);
     agent.session.triggerResponse(
-      extraInstructions ?? this.composeTurnInstructions(agent)
+      preGeneratedText ? undefined : (extraInstructions ?? this.composeTurnInstructions(agent)),
+      preGeneratedText ? { preGeneratedText } : undefined
     );
   }
 
@@ -1395,15 +1445,14 @@ export class Orchestrator extends EventEmitter {
 
     const isFirstReaction = this.chainTurnCount === 0;
     let shouldChain = isFirstReaction;
-    let chainSource: "groq" | "fallback" | "first_guaranteed" = "first_guaranteed";
+    let chainSource: "gemini" | "fallback" | "first_guaranteed" = "first_guaranteed";
     let chainReason: string | undefined = isFirstReaction
       ? "first reaction after human turn (guaranteed)"
       : undefined;
 
     if (!isFirstReaction) {
-      if (this.groqApiKey) {
-        const decision = await shouldContinueChainWithGroq({
-          apiKey: this.groqApiKey,
+      if (this.routingEnabled) {
+        const decision = await shouldContinueChainWithGemini({
           humanName: this.humanName,
           turns: this.conversationTurns,
           chainTurnCount: this.chainTurnCount,
@@ -1416,12 +1465,12 @@ export class Orchestrator extends EventEmitter {
         if (generation !== this.selectionGeneration) return;
 
         shouldChain = decision.continue;
-        chainSource = decision.source === "groq" ? "groq" : "fallback";
-        chainReason = decision.source === "groq" ? decision.reason : undefined;
-        if (decision.source === "groq") {
+        chainSource = decision.source === "gemini" ? "gemini" : "fallback";
+        chainReason = decision.source === "gemini" ? decision.reason : undefined;
+        if (decision.source === "gemini") {
           this.emit(
             "systemEvent",
-            `GROQ: chain ${shouldChain ? "continues" : "pauses"}${decision.reason ? ` — ${decision.reason}` : ""}`
+            `GEMINI: chain ${shouldChain ? "continues" : "pauses"}${decision.reason ? ` — ${decision.reason}` : ""}`
           );
         }
       } else {

@@ -33,8 +33,6 @@ export async function POST(request: NextRequest) {
         description: body.description ?? "",
         system_prompt: body.system_prompt,
         voice: normalizeVoice(body.voice),
-        provider: body.provider ?? "openai",
-        model: body.model ?? "gpt-realtime-2",
         color: body.color ?? "#3b82f6",
         role_summary: body.role_summary ?? body.description ?? "",
         peer_profile: body.peer_profile ?? "",

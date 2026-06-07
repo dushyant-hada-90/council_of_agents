@@ -15,7 +15,7 @@ export interface TurnRecord {
   addressee?: { kind: string; name?: string };
   replyTo?: { kind: string; name: string };
   routingReason?: string;
-  routingSource?: "groq" | "named_fallback" | "random" | "engagement";
+  routingSource?: "gemini" | "named_fallback" | "random" | "engagement";
 }
 
 export interface RoutingRecord {
@@ -23,7 +23,7 @@ export interface RoutingRecord {
   context: "human_turn" | "chain" | "engagement";
   selectedSpeakerId: string;
   selectedSpeaker: string;
-  source: "groq" | "named_fallback" | "random" | "human_handoff" | "engagement";
+  source: "gemini" | "named_fallback" | "random" | "human_handoff" | "engagement";
   reason?: string;
   label: string;
 }
@@ -55,7 +55,7 @@ export interface ChainRecord {
   addresseeKind: "human" | "everyone" | "agent";
   addresseeName?: string;
   decision: "continue" | "pause";
-  source: "groq" | "fallback" | "first_guaranteed" | "safety_cap";
+  source: "gemini" | "fallback" | "first_guaranteed" | "safety_cap";
   reason?: string;
 }
 

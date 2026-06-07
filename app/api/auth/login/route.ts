@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/auth/user";
-import { hashPassword, isValidPassword, isValidUsername, verifyPassword } from "@/lib/auth/password";
+import { isValidPassword, isValidUsername, verifyPassword } from "@/lib/auth/password";
 import { signSession, sessionCookieOptions } from "@/lib/auth/session";
 
 export async function POST(request: NextRequest) {

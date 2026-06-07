@@ -1,9 +1,9 @@
 import Link from "next/link";
 import { AppShell } from "@/components/AppShell";
-import { requireUser, getDb } from "@/lib/supabase/server";
+import { requireUserOrRedirect, getDb } from "@/lib/supabase/server";
 
 export default async function MeetingsPage() {
-  const user = await requireUser();
+  const user = await requireUserOrRedirect("/login?redirect=/meetings");
   const db = getDb();
   const { data: meetings } = await db
     .from("meetings")

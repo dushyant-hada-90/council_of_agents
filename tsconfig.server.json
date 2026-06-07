@@ -10,6 +10,6 @@
     "incremental": false,
     "plugins": []
   },
-  "include": ["server.ts", "server/**/*", "lib/env.ts", "lib/auth/token.ts", "lib/auth/**/*", "lib/agents/**/*", "lib/types/**/*", "lib/supabase/admin.ts"],
-  "exclude": ["node_modules", "app", "components", "middleware.ts", "server/index.ts"]
+  "include": ["server.ts", "server/**/*", "lib/env.ts", "lib/config/**/*", "lib/auth/token.ts", "lib/auth/**/*", "lib/agents/**/*", "lib/types/**/*", "lib/supabase/admin.ts"],
+  "exclude": ["node_modules", "app", "components", "middleware.ts"]
 }

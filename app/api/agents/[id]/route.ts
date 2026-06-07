@@ -37,8 +37,6 @@ export async function PUT(request: NextRequest, { params }: Params) {
         description: body.description,
         system_prompt: body.system_prompt,
         voice: normalizeVoice(body.voice),
-        provider: body.provider,
-        model: body.model,
         color: body.color,
         role_summary: body.role_summary,
         peer_profile: body.peer_profile,

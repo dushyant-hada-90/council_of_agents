@@ -19,7 +19,7 @@ export class TranscriptPersister {
 
   constructor(
     private readonly meetingId: string,
-    private readonly userId: string,
+    private readonly userId: string | null,
     private readonly flushIntervalMs: number
   ) {
     this.flushTimer = setInterval(() => {

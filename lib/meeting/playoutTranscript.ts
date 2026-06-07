@@ -1,6 +1,6 @@
 /**
  * Buffers agent transcripts and reveals text word-by-word in sync with
- * scheduled Web Audio playout — not when the Realtime API finishes.
+ * scheduled Web Audio playout — not when Gemini/TTS finishes generating audio.
  */
 
 export interface TranscriptDisplayLine {

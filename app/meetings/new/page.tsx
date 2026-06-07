@@ -1,10 +1,10 @@
 import { AppShell } from "@/components/AppShell";
 import { MeetingConfigForm } from "@/components/MeetingConfigForm";
-import { requireUser, getDb } from "@/lib/supabase/server";
+import { requireUserOrRedirect, getDb } from "@/lib/supabase/server";
 import type { AgentRow } from "@/lib/types/database";
 
 export default async function NewMeetingPage() {
-  const user = await requireUser();
+  const user = await requireUserOrRedirect("/login?redirect=/meetings/new");
   const db = getDb();
   const { data } = await db
     .from("agents")

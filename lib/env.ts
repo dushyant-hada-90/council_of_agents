@@ -3,22 +3,29 @@ import { z } from "zod";
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().int().positive().default(3000),
-  OPENAI_API_KEY: z.string().min(1, "OPENAI_API_KEY is required"),
-  OPENAI_REALTIME_MODEL: z.string().default("gpt-realtime-2"),
-  OPENAI_TRANSCRIPTION_MODEL: z.string().default("gpt-4o-mini-transcribe"),
-  GROQ_API_KEY: z.string().optional(),
-  GROQ_ROUTING_MODEL: z.string().default("meta-llama/llama-4-scout-17b-16e-instruct"),
-  GROQ_ROUTING_TIMEOUT_MS: z.coerce.number().int().positive().default(3000),
-  HUMAN_REALTIME_TRANSCRIPT_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+  GCP_PROJECT_ID: z.string().min(1, "GCP_PROJECT_ID is required"),
+  GOOGLE_APPLICATION_CREDENTIALS: z
+    .string()
+    .min(1, "GOOGLE_APPLICATION_CREDENTIALS is required (path to GCP service account JSON)"),
+  GEMINI_PLANNER_MODEL: z.string().default("gemini-2.0-flash"),
+  GEMINI_CHAT_MODEL: z.string().default("gemini-2.0-flash"),
+  GEMINI_ROUTING_MODEL: z.string().default("gemini-2.0-flash"),
+  GEMINI_ROUTING_TIMEOUT_MS: z.coerce.number().int().positive().default(3000),
+  GEMINI_MERGED_TURN_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
+  AWS_REGION: z.string().min(1, "AWS_REGION is required"),
+  AWS_ACCESS_KEY_ID: z.string().min(1, "AWS_ACCESS_KEY_ID is required"),
+  AWS_SECRET_ACCESS_KEY: z.string().min(1, "AWS_SECRET_ACCESS_KEY is required"),
+  S3_BUCKET_NAME: z.string().min(1, "S3_BUCKET_NAME is required"),
+  GUEST_AUDIO_WARN_SECONDS: z.coerce.number().int().positive().default(480),
+  GUEST_AUDIO_MAX_SECONDS: z.coerce.number().int().positive().default(600),
   LOG_LEVEL: z.enum(["minimal", "verbose", "info", "debug"]).default("minimal"),
-  NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
-  NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
-  AUTH_SECRET: z.string().min(32, "AUTH_SECRET must be at least 32 characters"),
+  HUMAN_STT_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   TRANSCRIPT_FLUSH_INTERVAL_MS: z.coerce.number().int().positive().default(60000),
-  /** End meeting after this much silence (no audio/transcript activity). Default 4 minutes. */
-  MEETING_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(240000),
   SESSION_RECORDINGS_DIR: z.string().optional(),
+  AUTH_SECRET: z.string().min(32, "AUTH_SECRET must be at least 32 characters"),
+  NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
+  MEETING_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(240000),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -34,12 +41,4 @@ export function getEnv(): Env {
   }
   cached = parsed.data;
   return cached;
-}
-
-export function getEnvSafe(): Env | null {
-  try {
-    return getEnv();
-  } catch {
-    return null;
-  }
 }

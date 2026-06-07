@@ -4,7 +4,7 @@ const nextConfig: NextConfig = {
   output: "standalone",
   reactStrictMode: true,
   poweredByHeader: false,
-  transpilePackages: ["@supabase/ssr", "@supabase/supabase-js"],
+  transpilePackages: ["@supabase/supabase-js"],
 };
 
 export default nextConfig;

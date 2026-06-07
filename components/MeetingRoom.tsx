@@ -36,15 +36,28 @@ interface InterruptPlaybackReport {
 interface MeetingRoomProps {
   meetingId: string;
   humanName: string;
+  initialAgents?: AgentMeta[];
+  isGuest?: boolean;
+  guestToken?: string;
+  refinedPrompt?: string;
+  audioLimits?: { audioWarnSeconds: number; audioMaxSeconds: number };
 }
 
-export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
+export function MeetingRoom({
+  meetingId,
+  humanName,
+  initialAgents = [],
+  isGuest = false,
+  guestToken,
+  refinedPrompt,
+  audioLimits,
+}: MeetingRoomProps) {
   const router = useRouter();
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [ending, setEnding] = useState(false);
-  const [agents, setAgents] = useState<AgentMeta[]>([]);
+  const [agents, setAgents] = useState<AgentMeta[]>(initialAgents);
   const [displayStatus, setDisplayStatus] = useState("Idle");
   const [displayLines, setDisplayLines] = useState<TranscriptDisplayLine[]>([]);
   const [speakingAgentId, setSpeakingAgentId] = useState<string | null>(null);
@@ -52,6 +65,9 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
   const [humanTurnReady, setHumanTurnReady] = useState(false);
   const [engagementHint, setEngagementHint] = useState<string | null>(null);
   const [meetingEnded, setMeetingEnded] = useState(false);
+  const [audioLimitWarning, setAudioLimitWarning] = useState<number | null>(null);
+  const [audioLimitEnded, setAudioLimitEnded] = useState(false);
+  const [endReason, setEndReason] = useState<string | null>(null);
   const transcriptEngineRef = useRef(new PlayoutTranscriptEngine());
   const lastHeardAgentRef = useRef<string | null>(null);
   const lastDisplayStatusRef = useRef("Idle");
@@ -72,7 +88,7 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
   }
 
   /** Navigate away after meeting is fully ended on the server. */
-  function finalizeEnd() {
+  function finalizeEnd(reason?: string) {
     if (hasNavigatedRef.current) return;
     hasNavigatedRef.current = true;
     clearEndFallbackTimer();
@@ -82,7 +98,18 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
     setConnected(false);
     connectedRef.current = false;
     wsRef.current?.close();
-    router.push(`/meetings/${meetingId}/transcript`);
+
+    if (reason === "audio_limit" && isGuest) {
+      setAudioLimitEnded(true);
+      setEndReason("audio_limit");
+      return;
+    }
+
+    router.push(
+      isGuest && guestToken
+        ? `/meetings/${meetingId}/transcript?guest=${encodeURIComponent(guestToken)}`
+        : `/meetings/${meetingId}/transcript`
+    );
   }
 
   async function endMeeting() {
@@ -93,7 +120,9 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
     const fallbackEnd = () => {
       void (async () => {
         try {
-          await fetch(`/api/meetings/${meetingId}/end`, { method: "POST" });
+          if (!isGuest) {
+            await fetch(`/api/meetings/${meetingId}/end`, { method: "POST" });
+          }
         } catch {
           setError("Failed to end meeting — try again");
           endInFlightRef.current = false;
@@ -111,7 +140,9 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
         endFallbackTimerRef.current = setTimeout(fallbackEnd, 8000);
         return;
       }
-      await fetch(`/api/meetings/${meetingId}/end`, { method: "POST" });
+      if (!isGuest) {
+        await fetch(`/api/meetings/${meetingId}/end`, { method: "POST" });
+      }
       finalizeEnd();
     } catch {
       clearEndFallbackTimer();
@@ -153,7 +184,7 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
   const playoutBlockedRef = useRef(false);
   const isPTTActiveRef = useRef(false);
   const connectedRef = useRef(false);
-  const agentsRef = useRef<AgentMeta[]>([]);
+  const agentsRef = useRef<AgentMeta[]>(initialAgents);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const playoutScheduleRef = useRef<Map<string, PlayoutChunk[]>>(new Map());
 
@@ -286,16 +317,26 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
   }
 
   const connect = useCallback(async () => {
-    const sessionRes = await fetch("/api/auth/session");
-    if (!sessionRes.ok) {
-      setError("Not authenticated");
-      setConnecting(false);
-      return;
+    let accessToken: string;
+
+    if (isGuest && guestToken) {
+      accessToken = guestToken;
+    } else {
+      const sessionRes = await fetch("/api/auth/session");
+      if (!sessionRes.ok) {
+        setError("Not authenticated");
+        setConnecting(false);
+        return;
+      }
+      const session = await sessionRes.json();
+      accessToken = session.accessToken;
     }
-    const { accessToken } = await sessionRes.json();
 
     try {
-      const historyRes = await fetch(`/api/transcripts/${meetingId}`);
+      const historyUrl = isGuest
+        ? `/api/guest/transcripts/${meetingId}?token=${encodeURIComponent(accessToken)}`
+        : `/api/transcripts/${meetingId}`;
+      const historyRes = await fetch(historyUrl);
       if (historyRes.ok) {
         const history = (await historyRes.json()) as {
           meeting?: { status?: string };
@@ -341,21 +382,24 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       connectedRef.current = true;
       setConnected(true);
       setConnecting(false);
+      setError(null);
     };
 
     ws.onclose = (ev) => {
+      if (wsRef.current !== ws) return;
       connectedRef.current = false;
       setConnected(false);
+      setConnecting(false);
       if (endInFlightRef.current || hasNavigatedRef.current) {
-        if (ev.code === 1000) finalizeEnd();
+        if (ev.code === 1000) finalizeEnd(endReason ?? undefined);
         return;
       }
       if (ev.code === 4004 || ev.reason?.includes("ended")) {
         setMeetingEnded(true);
-        setConnecting(false);
         return;
       }
       if (ev.code !== 1000) {
@@ -363,9 +407,14 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
       }
     };
 
-    ws.onerror = () => setError("WebSocket connection failed");
+    ws.onerror = () => {
+      if (wsRef.current !== ws) return;
+      setError("WebSocket connection failed");
+      setConnecting(false);
+    };
 
     ws.onmessage = (ev) => {
+      if (wsRef.current !== ws) return;
       if (ev.data instanceof ArrayBuffer) {
         handleAudioFrame(ev.data);
         return;
@@ -375,7 +424,7 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
         handleControlMessage(msg);
       } catch { /* ignore */ }
     };
-  }, [meetingId]);
+  }, [meetingId, isGuest, guestToken]);
 
   function handleControlMessage(msg: Record<string, unknown>) {
     switch (msg.type) {
@@ -438,8 +487,11 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
       case "STOP_CLIENT_AUDIO":
         stopPlayback(msg.epoch as number);
         break;
+      case "AUDIO_LIMIT_WARNING":
+        setAudioLimitWarning(msg.remainingSeconds as number);
+        break;
       case "MEETING_ENDED":
-        finalizeEnd();
+        finalizeEnd(msg.reason as string | undefined);
         break;
     }
   }
@@ -589,7 +641,16 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
     return () => {
       clearEndFallbackTimer();
       cancelAnimationFrame(rafId);
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      connectedRef.current = false;
+      if (ws) {
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        ws.close();
+      }
       scriptProcessorRef.current?.disconnect();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       audioCtxRef.current?.close();
@@ -600,6 +661,32 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
 
   return (
     <div className="space-y-4">
+      {refinedPrompt && isGuest && (
+        <p className="text-sm text-gray-400 border-l-2 border-accent pl-3">{refinedPrompt}</p>
+      )}
+
+      {audioLimitWarning !== null && !audioLimitEnded && (
+        <div className="bg-yellow-900/40 border border-yellow-700 text-yellow-200 px-4 py-3 rounded-lg text-sm">
+          About {Math.ceil(audioLimitWarning / 60)} minute{audioLimitWarning >= 120 ? "s" : ""} of free audio remaining.
+          {" "}
+          <a href="/signup" className="underline hover:text-white">Sign up</a> for unlimited meetings.
+        </div>
+      )}
+
+      {audioLimitEnded && (
+        <div className="bg-surface-border border border-gray-600 rounded-lg p-6 text-center space-y-4">
+          <h2 className="text-xl font-semibold">Free session complete</h2>
+          <p className="text-gray-400">
+            You&apos;ve used your {audioLimits ? Math.round(audioLimits.audioMaxSeconds / 60) : 10} minutes of free guest audio.
+            Sign up to continue exploring with unlimited meeting time and saved history.
+          </p>
+          <div className="flex gap-3 justify-center">
+            <a href="/signup" className="btn-primary px-6 py-2">Sign up free</a>
+            <a href="/login" className="text-gray-300 hover:text-white px-6 py-2">Log in</a>
+          </div>
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">Live Meeting</h1>
@@ -628,7 +715,7 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
         </p>
       )}
 
-      {!meetingEnded && (
+      {!meetingEnded && !audioLimitEnded && (
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="card text-center border-blue-500/50">
           <p className="font-medium">{humanName}</p>
@@ -655,7 +742,7 @@ export function MeetingRoom({ meetingId, humanName }: MeetingRoomProps) {
       </div>
       )}
 
-      {!meetingEnded && (
+      {!meetingEnded && !audioLimitEnded && (
       <div className="flex justify-center">
         <button
           onMouseDown={startPTT}

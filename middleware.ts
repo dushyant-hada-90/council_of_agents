@@ -1,16 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifySessionToken, SESSION_COOKIE } from "@/lib/auth/token";
 
-const protectedPaths = ["/dashboard", "/agents", "/meetings"];
+const protectedPaths = ["/dashboard", "/agents", "/meetings/new"];
+const protectedExactPaths = ["/meetings"];
 
 export async function middleware(request: NextRequest) {
   const token = request.cookies.get(SESSION_COOKIE)?.value;
   const session = token ? await verifySessionToken(token) : null;
   const path = request.nextUrl.pathname;
 
-  const isProtected = protectedPaths.some(
-    (p) => path === p || path.startsWith(`${p}/`)
-  );
+  const isProtected =
+    protectedPaths.some((p) => path === p || path.startsWith(`${p}/`)) ||
+    protectedExactPaths.some((p) => path === p);
+
   const isAuthPage = path === "/login" || path === "/signup";
 
   if (isProtected && !session) {

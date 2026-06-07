@@ -1,24 +1,27 @@
 import WebSocket from "ws";
 import type { MeetingConfig } from "../lib/agents/types";
 import { buildAgentConfigs } from "../lib/agents/roster";
-import { RealtimeSession } from "./realtimeSession";
-import { HumanTranscriptionSession } from "./humanTranscriptionSession";
+import { PipelineAgentSession } from "./pipelineAgentSession";
+import type { AgentSession } from "./agentSession";
 import { AudioMixer } from "./audioMixer";
 import { Orchestrator, InterruptPlaybackReport } from "./orchestrator";
 import { SessionRecorder } from "./sessionRecorder";
 import { TranscriptPersister, registerPersister, unregisterPersister } from "./transcriptPersister";
+import { AudioUsageTracker } from "./audioUsageTracker";
+import { S3AudioUploader, setMeetingS3Prefix } from "./s3AudioUploader";
 import { logger } from "./logger";
 import { bumpPlayoutEpoch, getPlayoutEpoch, resetPlayoutEpoch } from "./playoutEpoch";
 import { resolveHumanTranscript } from "./humanTranscribe";
 import { getSupabaseAdmin } from "../lib/supabase/admin";
 import { getEnv } from "../lib/env";
+import { PCM16_BYTES_PER_MS } from "./agentSession";
 
 export interface RoomClient {
   ws: WebSocket;
-  userId: string;
+  userId: string | null;
 }
 
-export type MeetingEndReason = "user" | "idle";
+export type MeetingEndReason = "user" | "idle" | "audio_limit";
 
 export interface ConferenceRoomCallbacks {
   onPermanentEnd: (reason: MeetingEndReason) => void;
@@ -31,15 +34,16 @@ export class ConferenceRoom {
 
   private mixer: AudioMixer;
   private orchestrator: Orchestrator;
-  private agentSessions: RealtimeSession[] = [];
-  private humanTranscription: HumanTranscriptionSession;
+  private agentSessions: AgentSession[] = [];
   private sessionRecorder: SessionRecorder;
   private transcriptPersister: TranscriptPersister;
+  private audioUsage: AudioUsageTracker | null = null;
+  private s3Uploader: S3AudioUploader;
   private client: RoomClient | null = null;
+  private pendingAudioLimitEnd = false;
 
   private humanAudioChunks: Buffer[] = [];
   private humanTranscriptDelivered = false;
-  private readonly apiKey: string;
   private readonly idleTimeoutMs: number;
   private readonly onPermanentEnd: (reason: MeetingEndReason) => void;
   private lastActivityAt = Date.now();
@@ -48,7 +52,6 @@ export class ConferenceRoom {
 
   constructor(
     meetingConfig: MeetingConfig,
-    apiKey: string,
     callbacks: ConferenceRoomCallbacks,
     idleTimeoutMs: number
   ) {
@@ -56,7 +59,6 @@ export class ConferenceRoom {
     this.idleTimeoutMs = idleTimeoutMs;
     this.meetingId = meetingConfig.meetingId;
     this.config = meetingConfig;
-    this.apiKey = apiKey;
     this.agents = buildAgentConfigs(meetingConfig.humanName, meetingConfig.agents, {
       topic: meetingConfig.topic,
       goal: meetingConfig.goal,
@@ -78,21 +80,41 @@ export class ConferenceRoom {
     );
     registerPersister(this.transcriptPersister);
 
-    this.orchestrator = new Orchestrator(
-      this.mixer,
-      process.env.GROQ_API_KEY,
-      this.sessionRecorder,
-      {
-        humanName: meetingConfig.humanName,
-        maxAiTurnsBeforeHuman: meetingConfig.maxAiTurnsBeforeHuman,
-      }
-    );
+    this.s3Uploader = new S3AudioUploader(meetingConfig.meetingId);
+    void setMeetingS3Prefix(meetingConfig.meetingId);
 
-    this.humanTranscription = new HumanTranscriptionSession(apiKey);
+    if (meetingConfig.isGuest) {
+      this.audioUsage = new AudioUsageTracker({
+        isGuest: true,
+        meetingId: meetingConfig.meetingId,
+        guestIp: meetingConfig.guestIp,
+        initialSeconds: meetingConfig.initialSpokenSeconds,
+        callbacks: {
+          onWarning: (remaining) => {
+            this.sendToClient({
+              type: "AUDIO_LIMIT_WARNING",
+              remainingSeconds: remaining,
+              timestamp: Date.now(),
+            });
+          },
+          onLimitReached: () => {
+            this.pendingAudioLimitEnd = true;
+            if (this.orchestrator.getState() !== "AGENT_SPEAKING") {
+              this.requestUserEnd("audio_limit");
+            }
+          },
+        },
+      });
+    }
+
+    this.orchestrator = new Orchestrator(this.mixer, this.sessionRecorder, {
+      humanName: meetingConfig.humanName,
+      maxAiTurnsBeforeHuman: meetingConfig.maxAiTurnsBeforeHuman,
+    });
+
     this.wireOrchestrator();
     this.wireMixer();
     this.initAgentSessions();
-    this.humanTranscription.connect();
     this.markMeetingActive();
     this.startIdleWatch();
   }
@@ -116,24 +138,21 @@ export class ConferenceRoom {
   private async markMeetingActive(): Promise<void> {
     try {
       const supabase = getSupabaseAdmin();
-      const { data: row } = await supabase
-        .from("meetings")
-        .select("started_at")
-        .eq("id", this.meetingId)
-        .eq("user_id", this.config.userId)
-        .maybeSingle();
+      let query = supabase.from("meetings").select("started_at").eq("id", this.meetingId);
+      if (this.config.userId) {
+        query = query.eq("user_id", this.config.userId);
+      } else {
+        query = query.eq("is_guest", true);
+      }
 
+      const { data: row } = await query.maybeSingle();
       const startedAt = (row as { started_at?: string | null } | null)?.started_at;
       const patch: Record<string, string> = { status: "active" };
       if (!startedAt) {
         patch.started_at = new Date().toISOString();
       }
 
-      await supabase
-        .from("meetings")
-        .update(patch as never)
-        .eq("id", this.meetingId)
-        .eq("user_id", this.config.userId);
+      await supabase.from("meetings").update(patch as never).eq("id", this.meetingId);
     } catch (err) {
       logger.warn("ROOM", `Failed to mark meeting active: ${(err as Error).message}`);
     }
@@ -145,11 +164,15 @@ export class ConferenceRoom {
     });
 
     this.orchestrator.on("agentSpeakingStart", (agentId: string, agentName: string) => {
+      if (this.audioUsage?.shouldBlockNewTurns()) return;
       this.sendToClient({ type: "AGENT_SPEAKING_START", agentId, agentName });
     });
 
     this.orchestrator.on("agentSpeakingEnd", (agentId: string) => {
       this.sendToClient({ type: "AGENT_SPEAKING_END", agentId });
+      if (this.pendingAudioLimitEnd) {
+        this.requestUserEnd("audio_limit");
+      }
     });
 
     this.orchestrator.on(
@@ -194,8 +217,12 @@ export class ConferenceRoom {
     this.mixer.on("clientAudio", (base64Chunk: string, agentId: string) => {
       if (!this.client?.ws || this.client.ws.readyState !== WebSocket.OPEN) return;
       this.touchActivity();
-      const agentIndex = this.agents.findIndex((a) => a.id === agentId);
+
       const audioBytes = Buffer.from(base64Chunk, "base64");
+      this.audioUsage?.addAgentAudio(audioBytes.byteLength);
+      this.s3Uploader.appendPcm("agent", agentId, audioBytes);
+
+      const agentIndex = this.agents.findIndex((a) => a.id === agentId);
       const frame = Buffer.allocUnsafe(3 + audioBytes.byteLength);
       frame.writeUInt8(agentIndex >= 0 ? agentIndex : 0, 0);
       frame.writeUInt16LE(getPlayoutEpoch(), 1);
@@ -206,15 +233,14 @@ export class ConferenceRoom {
 
   private initAgentSessions(): void {
     for (const agentConfig of this.agents) {
-      const session = new RealtimeSession(
+      const session = new PipelineAgentSession(
         agentConfig,
-        this.apiKey,
         this.agents,
         this.config.humanName
       );
       this.agentSessions.push(session);
       this.mixer.registerAgent(session);
-      this.orchestrator.registerAgent(session, agentConfig.name);
+      this.orchestrator.registerAgent(session, agentConfig.name, agentConfig.systemPrompt);
       session.on("transcriptDelta", (delta: string, agentId: string) => {
         this.touchActivity();
         this.sendToClient({
@@ -261,6 +287,8 @@ export class ConferenceRoom {
         agents: agentMeta,
         meetingId: this.meetingId,
         humanName: this.config.humanName,
+        isGuest: this.config.isGuest ?? false,
+        refinedPrompt: this.config.refinedPrompt,
       });
     }, 200);
   }
@@ -270,11 +298,29 @@ export class ConferenceRoom {
     void this.transcriptPersister.flush();
   }
 
+  getClient(): RoomClient | null {
+    return this.client;
+  }
+
+  /** Drop the current client so the same user/guest can reconnect (e.g. Strict Mode). */
+  evictClient(): void {
+    const existing = this.client;
+    if (!existing) return;
+    this.client = null;
+    if (existing.ws.readyState === WebSocket.OPEN) {
+      try {
+        existing.ws.close(1000, "Replaced by new connection");
+      } catch {
+        /* already closing */
+      }
+    }
+  }
+
   hasClient(): boolean {
     return this.client !== null && this.client.ws.readyState === WebSocket.OPEN;
   }
 
-  get userId(): string {
+  get userId(): string | null {
     return this.config.userId;
   }
 
@@ -287,6 +333,12 @@ export class ConferenceRoom {
   private deliverHumanTranscript(text: string | null, source: string): void {
     if (this.humanTranscriptDelivered) return;
     this.humanTranscriptDelivered = true;
+
+    if (this.audioUsage?.shouldBlockNewTurns()) {
+      this.requestUserEnd("audio_limit");
+      return;
+    }
+
     this.orchestrator.onHumanTranscript(text);
     if (text?.trim()) {
       this.persistTranscript({
@@ -309,12 +361,12 @@ export class ConferenceRoom {
 
   handleMessage(data: WebSocket.RawData, isBinary: boolean): void {
     if (isBinary) {
+      if (this.audioUsage?.shouldBlockNewTurns()) return;
       this.touchActivity();
       const audioBuf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
       this.humanAudioChunks.push(audioBuf);
-      if (this.humanTranscription.state === "READY") {
-        this.humanTranscription.appendAudio(audioBuf);
-      }
+      this.audioUsage?.addHumanAudio(audioBuf.byteLength);
+      this.s3Uploader.appendPcm("human", "human", audioBuf);
       this.mixer.routeHumanAudio(audioBuf);
       return;
     }
@@ -328,26 +380,26 @@ export class ConferenceRoom {
 
     switch (event.type) {
       case "START_SPEECH": {
+        if (this.audioUsage?.shouldBlockNewTurns()) return;
         this.touchActivity();
         this.humanAudioChunks = [];
         this.humanTranscriptDelivered = false;
-        this.humanTranscription.clearAudioBuffer();
         const report = event.playbackReport as InterruptPlaybackReport | undefined;
         const newEpoch = bumpPlayoutEpoch();
         this.orchestrator.onHumanSpeechStart(report, newEpoch);
         break;
       }
       case "END_SPEECH": {
+        if (this.audioUsage?.shouldBlockNewTurns()) {
+          this.requestUserEnd("audio_limit");
+          return;
+        }
         this.touchActivity();
         this.sessionRecorder.markHumanPttEnd();
         this.orchestrator.onHumanSpeechEnd();
         const chunks = this.humanAudioChunks.splice(0);
         this.humanAudioChunks = [];
-        void resolveHumanTranscript(chunks, {
-          realtimeSession: this.humanTranscription,
-          groqApiKey: process.env.GROQ_API_KEY,
-          openaiApiKey: this.apiKey,
-        })
+        void resolveHumanTranscript(chunks)
           .then(({ text, source }) => this.deliverHumanTranscript(text, source))
           .catch(() => {
             if (!this.humanTranscriptDelivered) this.deliverHumanTranscript(null, "error");
@@ -364,7 +416,6 @@ export class ConferenceRoom {
     }
   }
 
-  /** User pressed End meeting or idle timeout fired. */
   requestUserEnd(reason: MeetingEndReason): void {
     if (this.destroyed) return;
     this.sendToClient({ type: "MEETING_ENDED", reason });
@@ -372,7 +423,13 @@ export class ConferenceRoom {
     this.detachClient();
     this.onPermanentEnd(reason);
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.close(1000, reason === "idle" ? "Meeting idle timeout" : "Meeting ended");
+      const closeReason =
+        reason === "idle"
+          ? "Meeting idle timeout"
+          : reason === "audio_limit"
+            ? "Audio limit reached"
+            : "Meeting ended";
+      ws.close(1000, closeReason);
     }
   }
 
@@ -388,11 +445,12 @@ export class ConferenceRoom {
     this.sessionRecorder.flush();
     unregisterPersister(this.transcriptPersister);
     await this.transcriptPersister.destroy();
+    await this.audioUsage?.destroy();
+    await this.s3Uploader.destroy();
 
     this.orchestrator.destroy();
     this.mixer.destroy();
     for (const session of this.agentSessions) session.destroy();
-    this.humanTranscription.destroy();
     this.agentSessions = [];
     resetPlayoutEpoch();
 
@@ -428,7 +486,7 @@ export class RoomManager {
     return this.rooms.get(meetingId);
   }
 
-  createRoom(config: MeetingConfig, apiKey: string): ConferenceRoom {
+  createRoom(config: MeetingConfig): ConferenceRoom {
     if (!this.acceptingNewMeetings) {
       throw new Error("Server is shutting down — not accepting new meetings");
     }
@@ -438,7 +496,6 @@ export class RoomManager {
     const env = getEnv();
     const room = new ConferenceRoom(
       config,
-      apiKey,
       {
         onPermanentEnd: (reason) => {
           void this.endMeetingPermanently(config.meetingId, reason);
@@ -470,7 +527,6 @@ export class RoomManager {
     return this.rooms.size;
   }
 
-  /** End a live meeting (user button). Returns true if a room was active. */
   endMeeting(meetingId: string, userId: string): boolean {
     const room = this.rooms.get(meetingId);
     if (!room || room.userId !== userId) return false;

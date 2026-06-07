@@ -103,8 +103,6 @@ export function agentRowToConfig(row: {
   description: string;
   system_prompt: string;
   voice: string;
-  provider: string;
-  model: string;
   color: string;
   role_summary: string;
   peer_profile: string;
@@ -117,7 +115,5 @@ export function agentRowToConfig(row: {
     peerProfile: row.peer_profile,
     systemPrompt: row.system_prompt,
     color: row.color,
-    provider: row.provider,
-    model: row.model,
   };
 }

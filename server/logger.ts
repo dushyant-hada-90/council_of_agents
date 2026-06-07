@@ -58,11 +58,11 @@ const COMPONENT_COLORS: Record<string, string> = {
   ORCHESTRATOR: FG_YELLOW,
   MIXER:       FG_GREEN,
   SESSION:     FG_BLUE,
-  OPENAI:      FG_MAGENTA,
+  GEMINI:      FG_MAGENTA,
+  PIPELINE:    FG_GREEN,
   SYSTEM:      FG_WHITE,
   RECORDER:    FG_BRIGHT_MAGENTA,
   TRANSCRIBE:  FG_BLUE,
-  GROQ:        FG_GREEN,
 };
 
 /** Returns [HH:MM:SS.mmm] timestamp string */
@@ -170,20 +170,6 @@ export const logger = {
     log("STATE", "ORCHESTRATOR", `State: ${arrow}${detail}`);
   },
 
-  /** Log an OpenAI Realtime API WebSocket event (sent or received) */
-  wsEvent(
-    direction: "SENT" | "RECV",
-    agentId: string,
-    eventType: string,
-    extra?: unknown
-  ): void {
-    const dir =
-      direction === "SENT"
-        ? `${FG_GREEN}▲ SENT ${RESET}`
-        : `${FG_BLUE}▼ RECV ${RESET}`;
-    log("EVENT", "OPENAI", `${dir}[${agentId}] ${BOLD}${eventType}${RESET}`, extra);
-  },
-
   /** Log a client ↔ gateway WebSocket event */
   gatewayEvent(direction: "IN" | "OUT", eventType: string, extra?: unknown): void {
     const dir =
@@ -193,17 +179,6 @@ export const logger = {
     log("EVENT", "GATEWAY", `${dir}${BOLD}${eventType}${RESET}`, extra);
   },
 
-  /** Log audio routing info (kept brief to avoid log spam) */
-  audioRoute(from: string, to: string, bytes: number): void {
-    log(
-      "DEBUG",
-      "MIXER",
-      `${DIM}audio ${from} → ${to} (${bytes}B)${RESET}`
-    );
-  },
-
   startTimer,
   logLatency,
 };
-
-export default logger;
