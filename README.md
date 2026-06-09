@@ -2,7 +2,7 @@
 
 Multi-agent voice conference platform. Humans speak push-to-talk; AI advisors respond in turn over a live WebSocket room.
 
-**Voice stack:** Google Cloud Speech-to-Text → Gemini on Vertex AI → Google Cloud Text-to-Speech.
+**Voice stack:** Sarvam Speech-to-Text → Gemini on Vertex AI → Google Cloud Text-to-Speech.
 
 Built with **Next.js 15**, a custom **Node WebSocket server**, **Supabase Postgres** (storage only), and **AWS S3** (audio artifacts). Deploys to **Google Cloud Run**.
 
@@ -60,8 +60,8 @@ Chain reactions (agent-to-agent turns after the human spoke) use the same pipeli
 
 - **Node.js 20+**
 - **Supabase** project (Postgres only)
+- **Sarvam AI** API key ([dashboard.sarvam.ai](https://dashboard.sarvam.ai)) for human speech-to-text
 - **Google Cloud** project with:
-  - Speech-to-Text API enabled
   - Text-to-Speech API enabled
   - Vertex AI API enabled (for Gemini)
   - Service account JSON key (`GOOGLE_APPLICATION_CREDENTIALS`)
@@ -90,8 +90,11 @@ Required variables (see `.env.example` for defaults):
 
 | Variable | Purpose |
 |----------|---------|
+| `SARVAM_API_KEY` | Sarvam API key for human speech-to-text |
+| `SARVAM_STT_MODEL` | Sarvam STT model (default `saarika:v2.5`) |
+| `SARVAM_STT_LANGUAGE_CODE` | BCP-47 language or `unknown` for auto-detect |
 | `GCP_PROJECT_ID` | Google Cloud project for Vertex Gemini |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP service account JSON (STT, TTS, Gemini) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP service account JSON (TTS, Gemini) |
 | `GEMINI_PLANNER_MODEL` | Gemini model for guest agent planning (voice pipeline uses `gemini-3.5-flash` via Vertex publisher API) |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` | S3 audio storage |
 | `AUTH_SECRET` | JWT signing secret (≥32 chars) |

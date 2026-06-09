@@ -427,7 +427,7 @@ export class ConferenceRoom {
         this.orchestrator.onHumanSpeechEnd(
           estimateFinalSttTimeoutMs(getEnv().HUMAN_STT_TIMEOUT_MS)
         );
-        this.humanTranscriptStatus = `awaiting Google STT (${chunkCount} chunks, ${byteCount} bytes)`;
+        this.humanTranscriptStatus = `awaiting Sarvam STT (${chunkCount} chunks, ${byteCount} bytes)`;
 
         if (!transcriber || byteCount === 0) {
           this.sessionRecorder.markSttResult(null, "none", "no audio chunks captured on END_SPEECH");
@@ -444,7 +444,7 @@ export class ConferenceRoom {
             this.humanTranscriptStatus = result.meta.detail;
             this.sessionRecorder.markSttResult(
               result.text,
-              result.meta.source as "google" | "none" | "error",
+              result.meta.source as "sarvam" | "none" | "error",
               result.meta.detail
             );
             this.deliverHumanTranscript(result.text, result.meta);

@@ -41,7 +41,7 @@ export interface HumanTurnRecord {
   sttSubmitAt: number | null;
   sttResultAt: number | null;
   sttDurationMs: number | null;
-  sttSource: "google" | "none" | "error" | null;
+  sttSource: "sarvam" | "none" | "error" | null;
   sttText: string | null;
   sttDetail: string | null;
   /** True if the 10-second fallback timer fired before STT returned. */
@@ -402,7 +402,7 @@ export class SessionRecorder {
     this.markHumanPttEnd();
   }
 
-  /** Called immediately before the audio is submitted to Google STT. */
+  /** Called immediately before the audio is submitted to Sarvam STT. */
   markSttSubmit(): void {
     const now = Date.now();
     const rec = this.currentHumanTurn();
@@ -410,10 +410,10 @@ export class SessionRecorder {
     this.addEvent("stt_submit");
   }
 
-  /** Called when Google STT returns (text or empty). */
+  /** Called when Sarvam STT returns (text or empty). */
   markSttResult(
     text: string | null,
-    source: "google" | "none" | "error",
+    source: "sarvam" | "none" | "error",
     detail: string
   ): void {
     const now = Date.now();

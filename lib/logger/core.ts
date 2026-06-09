@@ -172,7 +172,7 @@ export const logger = {
     log("DEBUG", component, message, extra);
   },
 
-  /** Google STT/TTS/Gemini request/response — always logged regardless of LOG_LEVEL */
+  /** Sarvam STT / Google TTS / Gemini request/response — always logged regardless of LOG_LEVEL */
   api(component: string, message: string): void {
     log("INFO", component, message, undefined, true);
   },

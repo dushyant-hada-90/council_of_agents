@@ -20,7 +20,6 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1063.0",
-    "@google-cloud/speech": "^7.3.2",
     "@google-cloud/text-to-speech": "^6.4.1",
     "@supabase/supabase-js": "^2.49.1",
     "bcryptjs": "^2.4.3",
@@ -29,6 +28,7 @@
     "next": "^15.2.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "sarvamai": "^1.1.7",
     "ws": "^8.16.0",
     "zod": "^3.24.2"
   },

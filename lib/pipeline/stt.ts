@@ -1,20 +1,20 @@
-import { SpeechClient } from "@google-cloud/speech";
+import { SarvamAIClient } from "sarvamai";
+import { getEnv, type Env } from "@/lib/env";
 import {
   CAPTURE_SAMPLE_RATE,
   getHumanSttSegmentBytes,
   pcm16DurationSec,
 } from "@/lib/helpers/audio/pcm";
-import { getEnv } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { logApiRequest, logApiResponse, previewText } from "@/lib/logger/apiLog";
-import { stripWavHeaderIfPresent } from "./wav";
+import { pcmToWav, stripWavHeaderIfPresent } from "./wav";
 
-let client: SpeechClient | null = null;
+let client: SarvamAIClient | null = null;
 
-function getClient(): SpeechClient {
+function getClient(): SarvamAIClient {
   if (!client) {
-    const { GOOGLE_APPLICATION_CREDENTIALS } = getEnv();
-    client = new SpeechClient({ keyFilename: GOOGLE_APPLICATION_CREDENTIALS });
+    const { SARVAM_API_KEY } = getEnv();
+    client = new SarvamAIClient({ apiSubscriptionKey: SARVAM_API_KEY });
   }
   return client;
 }
@@ -32,8 +32,6 @@ export interface TranscribeResult {
 export interface TranscribeOptions {
   /** Sample rate the browser actually captured at (before any client resample). */
   captureSampleRate?: number;
-  /** Optional phrase hints for Google STT speechContexts (boost 15). */
-  speechContexts?: string[];
 }
 
 function detectContainerFormat(header: Buffer): string {
@@ -59,48 +57,11 @@ function computeRmsDb(audio: Buffer): number {
   return Math.round(20 * Math.log10(rms + 1e-9));
 }
 
-function buildSttConfig(sampleRateHertz: number, speechContexts: string[] = []) {
-  return {
-    encoding: "LINEAR16" as const,
-    sampleRateHertz,
-    audioChannelCount: 1,
-    languageCode: "en-IN",
-    alternativeLanguageCodes: ["en-US", "en-GB"],
-    model: "latest_long",
-    enableAutomaticPunctuation: true,
-    useEnhanced: true,
-    ...(speechContexts.length > 0 && {
-      speechContexts: [{ phrases: speechContexts, boost: 15 }],
-    }),
-  };
-}
-
-function extractTranscript(
-  results: Array<{ alternatives?: Array<{ transcript?: string | null }> | null }> | null | undefined
-): string {
-  return (
-    results
-      ?.map((r) => r.alternatives?.[0]?.transcript ?? "")
-      .join(" ")
-      .trim() ?? ""
-  );
-}
-
-async function recognizeSingleChunk(
-  audio: Buffer,
-  sttConfig: ReturnType<typeof buildSttConfig>
-): Promise<string> {
-  const [response] = await getClient().recognize({
-    config: sttConfig,
-    audio: { content: audio.toString("base64") },
-  });
-  return extractTranscript(response.results);
-}
-
 async function recognizePcm(
   audio: Buffer,
-  sttConfig: ReturnType<typeof buildSttConfig>,
-  rmsDb: number
+  rmsDb: number,
+  model: Env["SARVAM_STT_MODEL"],
+  languageCode: Env["SARVAM_STT_LANGUAGE_CODE"]
 ): Promise<string> {
   const maxSegmentBytes = getHumanSttSegmentBytes();
   if (audio.byteLength > maxSegmentBytes) {
@@ -110,16 +71,27 @@ async function recognizePcm(
     );
   }
 
+  const wav = pcmToWav(audio, STT_SAMPLE_RATE);
   const durationSec = pcm16DurationSec(audio.byteLength, STT_SAMPLE_RATE);
-  const operation = "recognize";
+  const operation = "speech-to-text";
 
   const reqStarted = logApiRequest(
     "STT",
     operation,
-    `${audio.byteLength}B PCM, ${rmsDb} dBFS, ~${durationSec.toFixed(1)}s, model=${sttConfig.model}`
+    `${audio.byteLength}B PCM, ${rmsDb} dBFS, ~${durationSec.toFixed(1)}s, model=${model}, lang=${languageCode}`
   );
 
-  const text = await recognizeSingleChunk(audio, sttConfig);
+  const response = await getClient().speechToText.transcribe({
+    file: {
+      data: wav,
+      filename: "audio.wav",
+      contentType: "audio/wav",
+    },
+    model: model as "saarika:v2.5" | "saaras:v3",
+    language_code: languageCode,
+  });
+
+  const text = response.transcript?.trim() ?? "";
 
   if (text) {
     logApiResponse("STT", reqStarted, operation, `"${previewText(text)}" (${rmsDb} dBFS)`);
@@ -140,7 +112,8 @@ function logSttDiagnostics(
   audio: Buffer,
   hadWavHeader: boolean,
   rmsDb: number,
-  sttConfig: ReturnType<typeof buildSttConfig>,
+  model: string,
+  languageCode: string,
   captureSampleRate?: number
 ): void {
   const header = rawAudio.slice(0, 4);
@@ -168,11 +141,11 @@ function logSttDiagnostics(
       `Client capture rate ${captureSampleRate}Hz ≠ STT rate ${STT_SAMPLE_RATE}Hz — client should resample before send`
     );
   }
-  logger.info("STT", `STT config: ${JSON.stringify(sttConfig)}`);
+  logger.info("STT", `STT config: model=${model}, language_code=${languageCode}`);
 }
 
 /**
- * Transcribe PCM16 mono audio using Google Cloud Speech-to-Text.
+ * Transcribe PCM16 mono audio using Sarvam Speech-to-Text.
  * Accepts raw PCM or WAV-wrapped LINEAR16 (header stripped automatically).
  * Input must be ≤ HUMAN_STT_SEGMENT_SEC (segment transcriber splits longer PTT).
  */
@@ -186,7 +159,7 @@ export async function transcribePcm16(
 
   const rawAudio = Buffer.concat(chunks);
   const captureSampleRate = options?.captureSampleRate;
-  const speechContexts = options?.speechContexts ?? [];
+  const { SARVAM_STT_MODEL, SARVAM_STT_LANGUAGE_CODE } = getEnv();
 
   const format = detectContainerFormat(rawAudio.slice(0, 4));
   if (format.includes("WEBM") || format.includes("OGG") || format.includes("MP4")) {
@@ -215,10 +188,17 @@ export async function transcribePcm16(
       };
     }
 
-    const sttConfig = buildSttConfig(STT_SAMPLE_RATE, speechContexts);
-    logSttDiagnostics(rawAudio, audio, hadWavHeader, rmsDb, sttConfig, captureSampleRate);
+    logSttDiagnostics(
+      rawAudio,
+      audio,
+      hadWavHeader,
+      rmsDb,
+      SARVAM_STT_MODEL,
+      SARVAM_STT_LANGUAGE_CODE,
+      captureSampleRate
+    );
 
-    let text = await recognizePcm(audio, sttConfig, rmsDb);
+    const text = await recognizePcm(audio, rmsDb, SARVAM_STT_MODEL, SARVAM_STT_LANGUAGE_CODE);
 
     if (text) {
       return { text, detail: "ok" };
@@ -233,10 +213,10 @@ export async function transcribePcm16(
 
     return {
       text: null,
-      detail: `Google STT returned empty transcript (${audio.byteLength} bytes PCM, ${rmsDb} dBFS, no speech detected)${mismatchHint}`,
+      detail: `Sarvam STT returned empty transcript (${audio.byteLength} bytes PCM, ${rmsDb} dBFS, no speech detected)${mismatchHint}`,
     };
   } catch (err) {
     const message = (err as Error).message;
-    return { text: null, detail: `Google STT API error: ${message}` };
+    return { text: null, detail: `Sarvam STT API error: ${message}` };
   }
 }

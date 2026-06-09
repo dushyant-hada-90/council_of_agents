@@ -1,6 +1,6 @@
 import { getEnv } from "@/lib/env";
 
-/** Target PCM rate for human mic capture and Google STT (matches agent TTS output). */
+/** Target PCM rate for human mic capture and STT (matches agent TTS output). */
 export const CAPTURE_SAMPLE_RATE = 24000;
 
 /** Bytes per millisecond for PCM16 mono at 24kHz. */

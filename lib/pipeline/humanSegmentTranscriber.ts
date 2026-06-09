@@ -18,7 +18,7 @@ interface SegmentJob {
 }
 
 /**
- * Rolling human STT: fires Google recognize every ~30s during PTT,
+ * Rolling human STT: fires Sarvam transcribe every ~30s during PTT,
  * keeps 5s audio overlap, merges transcripts on finalize.
  */
 export class HumanSegmentTranscriber {
@@ -133,7 +133,7 @@ export class HumanSegmentTranscriber {
     return {
       text: merged,
       meta: {
-        source: "google",
+        source: "sarvam",
         detail: `transcribed ${this.totalBytesReceived} bytes in ${this.segmentJobs.length} segment(s)`,
       },
     };

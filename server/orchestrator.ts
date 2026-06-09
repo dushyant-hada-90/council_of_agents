@@ -497,7 +497,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Called when Google STT returns the human's utterance (or a failure/empty result).
+   * Called when Sarvam STT returns the human's utterance (or a failure/empty result).
    * Appends the utterance to conversation history; Gemini routes the next speaker.
    */
   public onHumanTranscript(text: string | null, meta?: HumanTranscriptMeta): void {

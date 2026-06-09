@@ -1,7 +1,7 @@
 import { transcribePcm16 } from "./stt";
 import { logger } from "@/lib/logger";
 
-export type HumanTranscriptSource = "google" | "none" | "error";
+export type HumanTranscriptSource = "sarvam" | "none" | "error";
 
 export interface HumanTranscriptMeta {
   source: HumanTranscriptSource;
@@ -31,7 +31,7 @@ export async function resolveHumanTranscript(
     if (stt.text?.trim()) {
       return {
         text: stt.text.trim(),
-        meta: { source: "google", detail: `transcribed ${byteCount} bytes` },
+        meta: { source: "sarvam", detail: `transcribed ${byteCount} bytes` },
       };
     }
 
