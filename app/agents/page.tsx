@@ -2,7 +2,7 @@ import Link from "next/link";
 import { AppShell } from "@/components/AppShell";
 import { AgentActions } from "@/components/AgentActions";
 import { requireUserOrRedirect, getDb } from "@/lib/supabase/server";
-import type { AgentRow } from "@/lib/types/database";
+import type { AgentRow } from "@/lib/supabase/types";
 
 export default async function AgentsPage() {
   const user = await requireUserOrRedirect("/login?redirect=/agents");

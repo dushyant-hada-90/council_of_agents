@@ -2,7 +2,7 @@
  * S3 Audio Bucket Cheatcodes
  * 
  * Usage:
- *   npx tsx scripts/s3-cheatcodes.ts <command> [args]
+ *   npx tsx scripts/s3/s3-cheatcodes.ts <command> [args]
  *
  * Commands:
  *   list-meetings              List all meetingIds (paginated, 10 at a time)
@@ -11,18 +11,21 @@
  *   bucket-size                Total size of bucket + top 10 heaviest meetings
  *   meeting-size <meetingId>   Size breakdown for one meeting
  *   delete-meeting <meetingId> Delete all objects for a meeting (with confirmation)
+ *   reset-bucket               Delete every object in the bucket (with confirmation)
+ *   meeting-audio <meetingId>  Download chronologically merged meeting audio → s3_audios/
  *   find-empty                 List meetings with 0 audio segments
  *   recent                     Show 10 most recently uploaded files
  */
 
 import "dotenv/config";
 import {
-  S3Client,
   ListObjectsV2Command,
   GetObjectCommand,
   DeleteObjectsCommand,
   ListObjectsV2CommandOutput,
 } from "@aws-sdk/client-s3";
+import { getS3Client, getBucketName } from "../../lib/s3/client";
+import { getSupabaseAdmin } from "../../lib/supabase/admin";
 import * as readline from "readline";
 import { exec } from "child_process";
 import * as fs from "fs";
@@ -31,18 +34,12 @@ import * as path from "path";
 
 // ─── Client setup ────────────────────────────────────────────────────────────
 
-function requireEnv(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) { console.error(`Missing ${name} in .env`); process.exit(1); }
-  return value;
-}
+const s3 = getS3Client();
+const BUCKET = getBucketName();
 
-const region = requireEnv("AWS_REGION");
-const accessKeyId = requireEnv("AWS_ACCESS_KEY_ID");
-const secretAccessKey = requireEnv("AWS_SECRET_ACCESS_KEY");
-const BUCKET = requireEnv("S3_BUCKET_NAME");
-
-const s3 = new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
+const REPO_ROOT = path.resolve(__dirname, "../..");
+const S3_AUDIOS_DIR = path.join(REPO_ROOT, "s3_audios");
+const PCM_SAMPLE_RATE = 24000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -68,7 +65,41 @@ async function prompt(question: string): Promise<string> {
   });
 }
 
-/** Fetch all objects under a prefix */
+async function downloadObject(key: string): Promise<Buffer> {
+  const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+function pcmToWav(pcm: Buffer, sampleRate = PCM_SAMPLE_RATE): Buffer {
+  const header = Buffer.alloc(44);
+  const dataSize = pcm.byteLength;
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function getSupabaseOptional() {
+  try {
+    return getSupabaseAdmin();
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch all objects under a prefix (empty prefix = entire bucket) */
 async function listAll(prefix: string) {
   const objects: { key: string; size: number; lastModified?: Date }[] = [];
   let token: string | undefined;
@@ -260,6 +291,116 @@ async function meetingSize(meetingId: string) {
   console.log(`  ${"TOTAL".padEnd(20)} ${String(objects.length).padEnd(6)} ${formatBytes(total).padEnd(12)} ~${formatDuration(total)}\n`);
 }
 
+/** RESET-BUCKET: delete every object in the bucket */
+async function resetBucket() {
+  console.log(`\n⚠️  RESET BUCKET: ${BUCKET}`);
+  console.log("  Scanning all objects...\n");
+  const objects = await listAll("");
+  if (objects.length === 0) {
+    console.log("  Bucket is already empty.\n");
+    return;
+  }
+
+  const totalSize = objects.reduce((sum, o) => sum + o.size, 0);
+  console.log(`  Objects : ${objects.length}`);
+  console.log(`  Size    : ${formatBytes(totalSize)}`);
+  console.log(`\n  This permanently deletes ALL files in the bucket.\n`);
+
+  const answer = await prompt(`  Type the bucket name "${BUCKET}" to confirm: `);
+  if (answer !== BUCKET) {
+    console.log("  Cancelled.\n");
+    return;
+  }
+
+  for (let i = 0; i < objects.length; i += 1000) {
+    const batch = objects.slice(i, i + 1000).map((o) => ({ Key: o.key }));
+    await s3.send(new DeleteObjectsCommand({ Bucket: BUCKET, Delete: { Objects: batch } }));
+    console.log(`  Deleted ${Math.min(i + 1000, objects.length)} / ${objects.length}...`);
+  }
+  console.log(`\n  ✅ Bucket reset complete — ${objects.length} objects removed.\n`);
+}
+
+interface SegmentRef {
+  s3Key: string;
+  speakerLabel: string;
+  createdAt: string;
+  size: number;
+}
+
+/** Resolve segment order: Supabase created_at when available, else S3 LastModified */
+async function resolveMeetingSegments(meetingId: string): Promise<SegmentRef[]> {
+  const supabase = getSupabaseOptional();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("meeting_audio_segments")
+      .select("s3_key, speaker_type, speaker_id, created_at")
+      .eq("meeting_id", meetingId)
+      .order("created_at", { ascending: true });
+
+    if (!error && data && data.length > 0) {
+      return data.map((row) => ({
+        s3Key: row.s3_key,
+        speakerLabel:
+          row.speaker_type === "human" ? "human" : `agent/${row.speaker_id}`,
+        createdAt: row.created_at,
+        size: 0,
+      }));
+    }
+  }
+
+  const objects = await listAll(`meetings/${meetingId}/`);
+  return objects
+    .filter((o) => o.key.endsWith(".pcm"))
+    .sort((a, b) => (a.lastModified?.getTime() ?? 0) - (b.lastModified?.getTime() ?? 0))
+    .map((o) => {
+      const rel = o.key.replace(`meetings/${meetingId}/`, "");
+      const speakerLabel = rel.split("/").slice(0, 2).join("/");
+      return {
+        s3Key: o.key,
+        speakerLabel,
+        createdAt: o.lastModified?.toISOString() ?? "",
+        size: o.size,
+      };
+    });
+}
+
+/** MEETING-AUDIO: download and merge all speakers chronologically */
+async function downloadMeetingAudio(meetingId: string) {
+  console.log(`\n🎧 Merging meeting audio: ${meetingId}\n`);
+
+  const segments = await resolveMeetingSegments(meetingId);
+  if (segments.length === 0) {
+    console.error("  No audio segments found for this meeting.");
+    process.exit(1);
+  }
+
+  console.log(`  Segments: ${segments.length} (chronological order)\n`);
+
+  const pcmParts: Buffer[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    process.stdout.write(`  [${i + 1}/${segments.length}] ${seg.s3Key} ... `);
+    const pcm = await downloadObject(seg.s3Key);
+    pcmParts.push(pcm);
+    console.log(`${formatBytes(pcm.byteLength)} · ~${formatDuration(pcm.byteLength)}`);
+  }
+
+  const mergedPcm = Buffer.concat(pcmParts);
+  fs.mkdirSync(S3_AUDIOS_DIR, { recursive: true });
+
+  const pcmPath = path.join(S3_AUDIOS_DIR, `${meetingId}.pcm`);
+  const wavPath = path.join(S3_AUDIOS_DIR, `${meetingId}.wav`);
+  fs.writeFileSync(pcmPath, mergedPcm);
+  fs.writeFileSync(wavPath, pcmToWav(mergedPcm));
+
+  console.log(`\n  ✅ Merged ${segments.length} segments`);
+  console.log(`  Duration : ~${formatDuration(mergedPcm.byteLength)}`);
+  console.log(`  Size     : ${formatBytes(mergedPcm.byteLength)} PCM`);
+  console.log(`  Saved to :`);
+  console.log(`    ${pcmPath}`);
+  console.log(`    ${wavPath}\n`);
+}
+
 /** DELETE-MEETING: delete all objects for a meeting */
 async function deleteMeeting(meetingId: string) {
   const objects = await listAll(`meetings/${meetingId}/`);
@@ -320,7 +461,7 @@ function help() {
 ║              S3 Audio Bucket Cheatcodes                      ║
 ╚══════════════════════════════════════════════════════════════╝
 
-  npx tsx scripts/s3-cheatcodes.ts <command> [args]
+  npx tsx scripts/s3/s3-cheatcodes.ts <command> [args]
 
   list-meetings              List all meetingIds (10 at a time, press y for more)
   meeting-map  <meetingId>   Visual tree: speakers, files, sizes
@@ -328,16 +469,23 @@ function help() {
   bucket-size                Total size + top 10 heaviest meetings
   meeting-size <meetingId>   Size breakdown per speaker for a meeting
   delete-meeting <meetingId> Delete all objects for a meeting (asks confirmation)
+  reset-bucket               Delete every object in the bucket (asks for bucket name)
+  meeting-audio <meetingId>  Merge all speakers chronologically → s3_audios/
   find-empty                 Find meetings with 0 or almost 0 audio
   recent                     Show 10 most recently uploaded files
   help                       Show this menu
 
+  npm shortcuts:
+    npm run s3:reset
+    npm run s3:audio -- <meetingId>
+
   Examples:
-    npx tsx scripts/s3-cheatcodes.ts list-meetings
-    npx tsx scripts/s3-cheatcodes.ts meeting-map a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    npx tsx scripts/s3-cheatcodes.ts play meetings/a1b2c3.../agent/f47ac.../3.pcm
-    npx tsx scripts/s3-cheatcodes.ts bucket-size
-    npx tsx scripts/s3-cheatcodes.ts meeting-size a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    npx tsx scripts/s3/s3-cheatcodes.ts list-meetings
+    npx tsx scripts/s3/s3-cheatcodes.ts meeting-map a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    npx tsx scripts/s3/s3-cheatcodes.ts meeting-audio a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    npx tsx scripts/s3/s3-cheatcodes.ts play meetings/a1b2c3.../agent/f47ac.../3.pcm
+    npx tsx scripts/s3/s3-cheatcodes.ts bucket-size
+    npx tsx scripts/s3/s3-cheatcodes.ts reset-bucket
 
   Note: To play audio, install ffmpeg:
     Windows : winget install ffmpeg
@@ -358,6 +506,8 @@ const [,, cmd, arg] = process.argv;
     case "bucket-size":     await bucketSize(); break;
     case "meeting-size":    if (!arg) { console.error("Usage: meeting-size <meetingId>"); process.exit(1); } await meetingSize(arg); break;
     case "delete-meeting":  if (!arg) { console.error("Usage: delete-meeting <meetingId>"); process.exit(1); } await deleteMeeting(arg); break;
+    case "reset-bucket":    await resetBucket(); break;
+    case "meeting-audio":   if (!arg) { console.error("Usage: meeting-audio <meetingId>"); process.exit(1); } await downloadMeetingAudio(arg); break;
     case "find-empty":      await findEmpty(); break;
     case "recent":          await recent(); break;
     default:                help(); break;

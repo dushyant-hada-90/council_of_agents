@@ -9,7 +9,7 @@ import {
   GUEST_SESSION_COOKIE,
   verifyGuestToken,
 } from "@/lib/auth/token";
-import type { MeetingRow, TranscriptMessageRow } from "@/lib/types/database";
+import type { MeetingRow, TranscriptMessageRow } from "@/lib/supabase/types";
 
 type Props = {
   params: Promise<{ id: string }>;

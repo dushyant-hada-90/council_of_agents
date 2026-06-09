@@ -1,24 +1,8 @@
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getEnv } from "../lib/env";
-import { getSupabaseAdmin } from "../lib/supabase/admin";
-import { PCM16_BYTES_PER_MS } from "./agentSession";
-import { logger } from "./logger";
-
-let s3Client: S3Client | null = null;
-
-function getS3(): S3Client {
-  if (!s3Client) {
-    const env = getEnv();
-    s3Client = new S3Client({
-      region: env.AWS_REGION,
-      credentials: {
-        accessKeyId: env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      },
-    });
-  }
-  return s3Client;
-}
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSupabaseAdmin } from "@/lib/supabase/admin";
+import { PCM16_BYTES_PER_MS } from "@/lib/helpers/audio/pcm";
+import { logger } from "@/lib/logger";
+import { getBucketName, getS3Client } from "./client";
 
 export class S3AudioUploader {
   private readonly meetingId: string;
@@ -75,10 +59,9 @@ export class S3AudioUploader {
     const s3Key = `${this.prefix}/${speakerType}/${speakerId}/${segIdx}.pcm`;
 
     try {
-      const env = getEnv();
-      await getS3().send(
+      await getS3Client().send(
         new PutObjectCommand({
-          Bucket: env.S3_BUCKET_NAME,
+          Bucket: getBucketName(),
           Key: s3Key,
           Body: pcm,
           ContentType: "application/octet-stream",

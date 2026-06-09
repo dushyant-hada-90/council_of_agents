@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import type { PipelineHooks } from "./agentSession";
 import { InterruptPlaybackReport } from "./conferenceTypes";
-import { logger } from "./logger";
+import { logger } from "../lib/logger";
 import { PCM16_BYTES_PER_MS } from "./agentSession";
 
 // ─── Core timeline event ──────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ export interface HumanTurnRecord {
   routingEndAt: number | null;
   routingDurationMs: number | null;
   /** How the next speaker was resolved. */
-  routingMethod: "merged_gemini" | "named_direct" | "random" | null;
+  routingMethod: "merged_gemini" | "server_fallback" | null;
   selectedAgentId: string | null;
   selectedAgentName: string | null;
   routingReason: string | null;
@@ -132,7 +132,7 @@ export interface TurnRecord {
   addressee?: { kind: string; name?: string };
   replyTo?: { kind: string; name: string };
   routingReason?: string;
-  routingSource?: "gemini" | "named_fallback" | "random" | "engagement";
+  routingSource?: "gemini" | "server_fallback" | "engagement";
 }
 
 export interface RoutingRecord {
@@ -140,7 +140,7 @@ export interface RoutingRecord {
   context: "human_turn" | "chain" | "engagement";
   selectedSpeakerId: string;
   selectedSpeaker: string;
-  source: "gemini" | "named_fallback" | "random" | "human_handoff" | "engagement";
+  source: "gemini" | "server_fallback" | "human_handoff" | "engagement";
   reason?: string;
   label: string;
 }
@@ -195,8 +195,7 @@ export interface SessionMetrics {
   routing: {
     avgDurationMs: number | null;
     geminiRate: number;
-    namedDirectRate: number;
-    randomRate: number;
+    serverFallbackRate: number;
     preGeneratedRate: number;
   };
 
@@ -456,7 +455,7 @@ export class SessionRecorder {
   markRoutingResult(
     agentId: string,
     agentName: string,
-    method: "merged_gemini" | "named_direct" | "random",
+    method: "merged_gemini" | "server_fallback",
     reason: string | undefined,
     preGenerated: boolean
   ): void {
@@ -744,8 +743,7 @@ export class SessionRecorder {
       .map((h) => h.routingDurationMs)
       .filter((v): v is number => v !== null);
     const geminiRoutedCount = routedTurns.filter((h) => h.routingMethod === "merged_gemini").length;
-    const namedCount = routedTurns.filter((h) => h.routingMethod === "named_direct").length;
-    const randomCount = routedTurns.filter((h) => h.routingMethod === "random").length;
+    const serverFallbackCount = routedTurns.filter((h) => h.routingMethod === "server_fallback").length;
     const preGenCount = routedTurns.filter((h) => h.preGeneratedResponse === true).length;
 
     // Gemini (separate chat calls only)
@@ -804,8 +802,7 @@ export class SessionRecorder {
       routing: {
         avgDurationMs: avg(routingDurations),
         geminiRate: routedTurns.length ? geminiRoutedCount / routedTurns.length : 0,
-        namedDirectRate: routedTurns.length ? namedCount / routedTurns.length : 0,
-        randomRate: routedTurns.length ? randomCount / routedTurns.length : 0,
+        serverFallbackRate: routedTurns.length ? serverFallbackCount / routedTurns.length : 0,
         preGeneratedRate: routedTurns.length ? preGenCount / routedTurns.length : 0,
       },
 

@@ -12,6 +12,7 @@ dist/
 sessions/
 logs/
 reports/
+s3_audios/
 .next
 .next/
 

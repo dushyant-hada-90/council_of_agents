@@ -59,6 +59,9 @@ const COMPONENT_COLORS: Record<string, string> = {
   MIXER:       FG_GREEN,
   SESSION:     FG_BLUE,
   GEMINI:      FG_MAGENTA,
+  CHAT_MODEL:  FG_BRIGHT_MAGENTA,
+  STT:         FG_BLUE,
+  TTS:         FG_BRIGHT_GREEN,
   PIPELINE:    FG_GREEN,
   SYSTEM:      FG_WHITE,
   RECORDER:    FG_BRIGHT_MAGENTA,
@@ -86,8 +89,14 @@ function colorizeLevel(level: LogLevel): string {
 }
 
 /** Core log function — all other helpers delegate here */
-function log(level: LogLevel, component: string, message: string, extra?: unknown): void {
-  if (!shouldEmit(level)) return;
+function log(
+  level: LogLevel,
+  component: string,
+  message: string,
+  extra?: unknown,
+  force = false
+): void {
+  if (!force && !shouldEmit(level)) return;
 
   const ts = `${DIM}[${getTimestamp()}]${RESET}`;
   const lvl = colorizeLevel(level);
@@ -161,6 +170,15 @@ export const logger = {
     // Suppress debug logs in production
     if (process.env.NODE_ENV === "production") return;
     log("DEBUG", component, message, extra);
+  },
+
+  /** Google STT/TTS/Gemini request/response — always logged regardless of LOG_LEVEL */
+  api(component: string, message: string): void {
+    log("INFO", component, message, undefined, true);
+  },
+
+  apiError(component: string, message: string): void {
+    log("ERROR", component, message, undefined, true);
   },
 
   /** Log an orchestrator FSM state transition */

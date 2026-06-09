@@ -1,15 +1,15 @@
 import http from "http";
 import { parse } from "url";
 import WebSocket, { WebSocketServer } from "ws";
-import { createClient } from "@supabase/supabase-js";
 import { verifySessionToken, verifyGuestToken } from "../lib/auth/token";
 import { agentRowToConfig } from "../lib/agents/roster";
 import { normalizeGoogleVoice } from "../lib/agents/types";
 import type { AgentConfig, MeetingConfig } from "../lib/agents/types";
-import type { AgentRow, AgentSnapshot, MeetingRow } from "../lib/types/database";
+import type { AgentRow, AgentSnapshot, MeetingRow } from "../lib/supabase/types";
+import { getSupabaseAdmin } from "../lib/supabase/admin";
 import { roomManager } from "./roomManager";
-import { logger } from "./logger";
-import { getGuestIpUsageSeconds } from "./audioUsageTracker";
+import { logger } from "../lib/logger";
+import { getGuestIpUsageSeconds } from "../lib/supabase/audioUsageTracker";
 
 type AuthResult =
   | { kind: "user"; userId: string; username: string }
@@ -30,10 +30,11 @@ async function verifyAnyToken(token: string, meetingId: string): Promise<AuthRes
 }
 
 function getSupabase() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) return null;
-  return createClient(url, key);
+  try {
+    return getSupabaseAdmin();
+  } catch {
+    return null;
+  }
 }
 
 function snapshotToConfig(snapshot: AgentSnapshot): AgentConfig {

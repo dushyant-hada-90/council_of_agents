@@ -1,6 +1,6 @@
 import { EventEmitter } from "events";
 import type { AgentSession } from "./agentSession";
-import { logger } from "./logger";
+import { logger } from "../lib/logger";
 
 export type MixerEvents = {
   clientAudio: [base64Chunk: string, agentId: string];

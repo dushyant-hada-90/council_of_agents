@@ -45,4 +45,4 @@ export interface AgentSession extends EventEmitter {
   getTranscriptUpToMs(audioEndMs: number): string;
 }
 
-export const PCM16_BYTES_PER_MS = 48;
+export { PCM16_BYTES_PER_MS } from "../lib/helpers/audio/pcm";

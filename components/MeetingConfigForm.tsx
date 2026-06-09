@@ -2,8 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import type { AgentRow } from "@/lib/types/database";
-import { MAX_AI_TURN_OPTIONS } from "@/lib/agents/types";
+import type { AgentRow } from "@/lib/supabase/types";
 
 interface MeetingConfigFormProps {
   agents: AgentRow[];
@@ -18,7 +17,6 @@ export function MeetingConfigForm({ agents }: MeetingConfigFormProps) {
   const [goal, setGoal] = useState("");
   const [context, setContext] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [maxAiTurns, setMaxAiTurns] = useState<2 | 4 | 6>(4);
   const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
 
   function toggleAgent(id: string) {
@@ -47,7 +45,6 @@ export function MeetingConfigForm({ agents }: MeetingConfigFormProps) {
         goal,
         context,
         instructions,
-        max_ai_turns_before_human: maxAiTurns,
         agent_ids: [...selectedAgents],
       }),
     });
@@ -90,20 +87,6 @@ export function MeetingConfigForm({ agents }: MeetingConfigFormProps) {
         <div>
           <label className="block text-sm text-gray-400 mb-1">Optional instructions</label>
           <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} rows={2} className="w-full" />
-        </div>
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">
-            Maximum AI turns before inviting you
-          </label>
-          <select
-            value={maxAiTurns}
-            onChange={(e) => setMaxAiTurns(Number(e.target.value) as 2 | 4 | 6)}
-            className="w-full"
-          >
-            {MAX_AI_TURN_OPTIONS.map((n) => (
-              <option key={n} value={n}>After every {n} AI turns</option>
-            ))}
-          </select>
         </div>
       </div>
 

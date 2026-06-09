@@ -3,8 +3,8 @@ import next from "next";
 import http from "http";
 import { setupWebSocketServer } from "./server/wsServer";
 import { roomManager } from "./server/roomManager";
-import { flushAllTranscripts } from "./server/transcriptPersister";
-import { logger } from "./server/logger";
+import { flushAllTranscripts } from "./lib/supabase/transcriptPersister";
+import { logger } from "./lib/logger";
 import { getEnv } from "./lib/env";
 
 const dev = process.env.NODE_ENV !== "production";

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { TranscriptMessageRow } from "@/lib/types/database";
+import type { TranscriptMessageRow } from "@/lib/supabase/types";
 
 export function TranscriptViewer({
   meetingId,

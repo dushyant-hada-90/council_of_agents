@@ -2,7 +2,7 @@ import { notFound } from "next/navigation";
 import { AppShell } from "@/components/AppShell";
 import { AgentForm } from "@/components/AgentForm";
 import { requireUserOrRedirect, getDb } from "@/lib/supabase/server";
-import type { AgentRow } from "@/lib/types/database";
+import type { AgentRow } from "@/lib/supabase/types";
 
 type Props = { params: Promise<{ id: string }> };
 

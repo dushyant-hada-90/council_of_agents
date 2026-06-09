@@ -1,5 +1,5 @@
-import { getSupabaseAdmin } from "../lib/supabase/admin";
-import { logger } from "./logger";
+import { getSupabaseAdmin } from "./admin";
+import { logger } from "@/lib/logger";
 
 export interface TranscriptBufferEntry {
   speakerId: string;

@@ -1,6 +1,13 @@
 import { SpeechClient } from "@google-cloud/speech";
-import { getEnv } from "../../lib/env";
-import { logger } from "../logger";
+import {
+  CAPTURE_SAMPLE_RATE,
+  getHumanSttSegmentBytes,
+  pcm16DurationSec,
+} from "@/lib/helpers/audio/pcm";
+import { getEnv } from "@/lib/env";
+import { logger } from "@/lib/logger";
+import { logApiRequest, logApiResponse, previewText } from "@/lib/logger/apiLog";
+import { generateJsonReply } from "./geminiChat";
 import { stripWavHeaderIfPresent } from "./wav";
 
 let client: SpeechClient | null = null;
@@ -13,8 +20,11 @@ function getClient(): SpeechClient {
   return client;
 }
 
-export const STT_SAMPLE_RATE = 24000;
+export const STT_SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
 const MIN_BYTES = STT_SAMPLE_RATE * 2 * 0.1;
+const STT_CLEANUP_MIN_DURATION_SEC = 10;
+
+export { estimateFinalSttTimeoutMs, getHumanSttSegmentBytes } from "@/lib/helpers/audio/pcm";
 
 export interface TranscribeResult {
   text: string | null;
@@ -24,6 +34,10 @@ export interface TranscribeResult {
 export interface TranscribeOptions {
   /** Sample rate the browser actually captured at (before any client resample). */
   captureSampleRate?: number;
+  /** Optional phrase hints for Google STT speechContexts (boost 15). */
+  speechContexts?: string[];
+  /** Skip Gemini post-cleanup (segment transcriber merges first, then cleans once). */
+  skipGeminiCleanup?: boolean;
 }
 
 function detectContainerFormat(header: Buffer): string {
@@ -49,11 +63,7 @@ function computeRmsDb(audio: Buffer): number {
   return Math.round(20 * Math.log10(rms + 1e-9));
 }
 
-function durationSecAtRate(byteLength: number, sampleRate: number): number {
-  return byteLength / (sampleRate * 2);
-}
-
-function buildSttConfig(sampleRateHertz: number) {
+function buildSttConfig(sampleRateHertz: number, speechContexts: string[] = []) {
   return {
     encoding: "LINEAR16" as const,
     sampleRateHertz,
@@ -63,7 +73,89 @@ function buildSttConfig(sampleRateHertz: number) {
     model: "latest_long",
     enableAutomaticPunctuation: true,
     useEnhanced: true,
+    ...(speechContexts.length > 0 && {
+      speechContexts: [{ phrases: speechContexts, boost: 15 }],
+    }),
   };
+}
+
+function extractTranscript(
+  results: Array<{ alternatives?: Array<{ transcript?: string | null }> | null }> | null | undefined
+): string {
+  return (
+    results
+      ?.map((r) => r.alternatives?.[0]?.transcript ?? "")
+      .join(" ")
+      .trim() ?? ""
+  );
+}
+
+async function recognizeSingleChunk(
+  audio: Buffer,
+  sttConfig: ReturnType<typeof buildSttConfig>
+): Promise<string> {
+  const [response] = await getClient().recognize({
+    config: sttConfig,
+    audio: { content: audio.toString("base64") },
+  });
+  return extractTranscript(response.results);
+}
+
+async function recognizePcm(
+  audio: Buffer,
+  sttConfig: ReturnType<typeof buildSttConfig>,
+  rmsDb: number
+): Promise<string> {
+  const maxSegmentBytes = getHumanSttSegmentBytes();
+  if (audio.byteLength > maxSegmentBytes) {
+    logger.warn(
+      "STT",
+      `PCM ${audio.byteLength}B exceeds segment limit ${maxSegmentBytes}B — caller must split`
+    );
+  }
+
+  const durationSec = pcm16DurationSec(audio.byteLength, STT_SAMPLE_RATE);
+  const operation = "recognize";
+
+  const reqStarted = logApiRequest(
+    "STT",
+    operation,
+    `${audio.byteLength}B PCM, ${rmsDb} dBFS, ~${durationSec.toFixed(1)}s, model=${sttConfig.model}`
+  );
+
+  const text = await recognizeSingleChunk(audio, sttConfig);
+
+  if (text) {
+    logApiResponse("STT", reqStarted, operation, `"${previewText(text)}" (${rmsDb} dBFS)`);
+    return text;
+  }
+
+  logApiResponse(
+    "STT",
+    reqStarted,
+    operation,
+    `empty transcript (${rmsDb} dBFS, ${audio.byteLength}B PCM)`
+  );
+  return "";
+}
+
+export async function cleanupSttTranscript(raw: string): Promise<string> {
+  const system = `You fix phonetic speech-to-text errors while preserving the speaker's intent and meaning.
+Do not add, remove, or reinterpret ideas — only correct likely misheard words and punctuation.
+Return JSON: {"cleaned":"<corrected transcript>"}`;
+  const user = `Raw STT transcript:\n"${raw}"`;
+
+  try {
+    const parsed = await generateJsonReply(system, user);
+    const cleaned = typeof parsed.cleaned === "string" ? parsed.cleaned.trim() : "";
+    if (cleaned) {
+      logger.info("STT", `Gemini STT cleanup applied (${raw.length}→${cleaned.length} chars)`);
+      return cleaned;
+    }
+  } catch (err) {
+    logger.warn("STT", `Gemini STT cleanup failed: ${(err as Error).message}`);
+  }
+  return raw;
 }
 
 function logSttDiagnostics(
@@ -91,7 +183,7 @@ function logSttDiagnostics(
   }
   logger.info(
     "STT",
-    `PCM bytes: ${audio.byteLength}, dBFS: ${rmsDb}, peak sample: ${peak}, duration @24kHz: ${durationSecAtRate(audio.byteLength, STT_SAMPLE_RATE).toFixed(2)}s`
+    `PCM bytes: ${audio.byteLength}, dBFS: ${rmsDb}, peak sample: ${peak}, duration @24kHz: ${pcm16DurationSec(audio.byteLength, STT_SAMPLE_RATE).toFixed(2)}s`
   );
   if (captureSampleRate && captureSampleRate !== STT_SAMPLE_RATE) {
     logger.warn(
@@ -105,6 +197,7 @@ function logSttDiagnostics(
 /**
  * Transcribe PCM16 mono audio using Google Cloud Speech-to-Text.
  * Accepts raw PCM or WAV-wrapped LINEAR16 (header stripped automatically).
+ * Input must be ≤ HUMAN_STT_SEGMENT_SEC (segment transcriber splits longer PTT).
  */
 export async function transcribePcm16(
   chunks: Buffer[],
@@ -116,8 +209,8 @@ export async function transcribePcm16(
 
   const rawAudio = Buffer.concat(chunks);
   const captureSampleRate = options?.captureSampleRate;
+  const speechContexts = options?.speechContexts ?? [];
 
-  // Reject non-WAV container formats early
   const format = detectContainerFormat(rawAudio.slice(0, 4));
   if (format.includes("WEBM") || format.includes("OGG") || format.includes("MP4")) {
     return {
@@ -145,24 +238,22 @@ export async function transcribePcm16(
       };
     }
 
-    const sttConfig = buildSttConfig(STT_SAMPLE_RATE);
+    const durationSec = pcm16DurationSec(audio.byteLength, STT_SAMPLE_RATE);
+    const sttConfig = buildSttConfig(STT_SAMPLE_RATE, speechContexts);
     logSttDiagnostics(rawAudio, audio, hadWavHeader, rmsDb, sttConfig, captureSampleRate);
 
-    const [response] = await getClient().recognize({
-      config: sttConfig,
-      audio: { content: audio.toString("base64") },
-    });
+    let text = await recognizePcm(audio, sttConfig, rmsDb);
 
-    const text = response.results
-      ?.map((r) => r.alternatives?.[0]?.transcript ?? "")
-      .join(" ")
-      .trim();
+    if (
+      text &&
+      !options?.skipGeminiCleanup &&
+      durationSec > STT_CLEANUP_MIN_DURATION_SEC &&
+      getEnv().GEMINI_STT_CLEANUP
+    ) {
+      text = await cleanupSttTranscript(text);
+    }
 
     if (text) {
-      logger.info(
-        "STT",
-        `Google STT: "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}" (${rmsDb} dBFS)`
-      );
       return { text, detail: "ok" };
     }
 
@@ -179,7 +270,6 @@ export async function transcribePcm16(
     };
   } catch (err) {
     const message = (err as Error).message;
-    logger.error("STT", `Google STT failed: ${message}`);
     return { text: null, detail: `Google STT API error: ${message}` };
   }
 }

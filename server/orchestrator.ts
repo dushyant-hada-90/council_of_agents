@@ -1,17 +1,17 @@
 import { EventEmitter } from "events";
 import { AgentSession } from "./agentSession";
 import { AudioMixer } from "./audioMixer";
-import { logger } from "./logger";
+import { logger } from "../lib/logger";
 import type { MaxAiTurnsBeforeHuman } from "../lib/agents/types";
 import { InterruptPlaybackReport } from "./conferenceTypes";
-import { agentNamesMatch, normalizeAgentNameToken } from "./nameMatching";
+import { agentNamesMatch, normalizeAgentNameToken } from "../lib/helpers/nameMatching";
 import { SessionRecorder } from "./sessionRecorder";
 import {
   ConversationTurn,
   pickSpeakerAndRespondWithGemini,
   shouldContinueChainWithGemini,
-} from "./nextSpeakerRouter";
-import type { HumanTranscriptMeta } from "./humanTranscribe";
+} from "../lib/pipeline/nextSpeakerRouter";
+import type { HumanTranscriptMeta } from "../lib/pipeline/humanTranscribe";
 import { getEnv } from "../lib/env";
 
 // ─── FSM State definitions ────────────────────────────────────────────────────
@@ -63,8 +63,8 @@ export type OrchestratorEvents = {
   stateChange: [prev: OrchestratorState, next: OrchestratorState];
   /** Last speaker is asking the Human a question before the queue drains. */
   humanInvited: [agentId: string, agentName: string];
-  /** Engagement question done — Human's turn to speak. */
-  humanTurnReady: [];
+  /** Engagement question done — Human's turn to speak. Optional STT failure notice. */
+  humanTurnReady: [sttNotice?: string];
 };
 
 // ─── Agent selection bookkeeping ─────────────────────────────────────────────
@@ -108,8 +108,8 @@ export class Orchestrator extends EventEmitter {
   /** Timer used to trigger a chain-reaction agent response after an agent finishes. */
   private chainTimer: NodeJS.Timeout | null = null;
 
-  /** Silence duration before agent selection after human stops speaking (ms). */
-  private readonly SILENCE_TIMEOUT_MS = 500;
+  /** Silence duration before agent selection after human transcript (ms). */
+  private readonly silenceTimeoutMs: number;
 
   /**
    * Fallback probability when Gemini is unavailable for chain continuation decisions.
@@ -180,6 +180,9 @@ export class Orchestrator extends EventEmitter {
   /** Bumped on interrupt so stale async Gemini picks are ignored. */
   private selectionGeneration = 0;
 
+  /** Prevents overlapping selectAndTriggerAgent runs (duplicate Gemini calls). */
+  private selectionInProgress = false;
+
   /** Whether the in-flight agent turn is replying to the human or continuing a chain. */
   private activeTurnContext: "human_turn" | "chain" = "chain";
   /** Agent id the active chain turn is reacting to (if chain). */
@@ -225,7 +228,8 @@ export class Orchestrator extends EventEmitter {
     this.routingEnabled = true;
     this.recorder = recorder ?? null;
     this.humanName = options?.humanName ?? "You";
-    this.maxAiTurnsBeforeHuman = options?.maxAiTurnsBeforeHuman ?? 4;
+    this.maxAiTurnsBeforeHuman = options?.maxAiTurnsBeforeHuman ?? getEnv().MAX_AI_TURNS_BEFORE_HUMAN;
+    this.silenceTimeoutMs = getEnv().POST_TRANSCRIPT_SILENCE_MS;
     logger.info("ORCHESTRATOR", "Gemini next-speaker router enabled");
   }
 
@@ -310,8 +314,13 @@ export class Orchestrator extends EventEmitter {
     this.lastHumanTranscript = null;
     this.chainTurnCount = 0;
     this.aiTurnsSinceHuman = 0;
+    this.agentsCompletedThisRound = [];
     this.recentAgentSpeakerIds = [];
     this.selectionGeneration++;
+
+    if (this.selectionInProgress) {
+      this.selectionInProgress = false;
+    }
 
     this.handleInterrupt(playbackReport, playoutEpoch);
     this.transitionTo("HUMAN_SPEAKING", "human PTT");
@@ -492,10 +501,14 @@ export class Orchestrator extends EventEmitter {
    * Called when the human releases Push-To-Talk (or a silence threshold is met).
    * Begins the decision window to select the next agent.
    */
-  public onHumanSpeechEnd(): void {
+  public onHumanSpeechEnd(sttTimeoutMs?: number): void {
     if (this.state !== "HUMAN_SPEAKING") return;
 
-    logger.info("ORCHESTRATOR", "Human speech END — awaiting transcript before selecting responder…");
+    const timeoutMs = sttTimeoutMs ?? this.transcriptFallbackMs;
+    logger.info(
+      "ORCHESTRATOR",
+      `Human speech END — awaiting transcript before selecting responder… (STT timeout ${timeoutMs}ms)`
+    );
     this.chainTurnCount = 0;
     this.agentsCompletedThisRound = [];
     this.awaitingHumanTranscript = true;
@@ -504,16 +517,17 @@ export class Orchestrator extends EventEmitter {
     this.clearTranscriptFallbackTimer();
     this.transcriptFallbackTimer = setTimeout(() => {
       this.transcriptFallbackTimer = null;
-      if (this.awaitingHumanTranscript && this.state === "DECIDING") {
-        const status = this.transcriptStatusProvider?.() ?? "STT status unknown";
-        logger.warn(
-          "ORCHESTRATOR",
-          `Transcript fallback after ${this.transcriptFallbackMs}ms — selecting responder without text. ${status}`
-        );
-        this.recorder?.markSttTimedOut();
-        this.scheduleAgentSelection();
-      }
-    }, this.transcriptFallbackMs);
+      if (!this.awaitingHumanTranscript || this.state !== "DECIDING") return;
+
+      this.awaitingHumanTranscript = false;
+      const status = this.transcriptStatusProvider?.() ?? "STT status unknown";
+      logger.warn(
+        "ORCHESTRATOR",
+        `Transcript fallback after ${timeoutMs}ms — selecting responder without text. ${status}`
+      );
+      this.recorder?.markSttTimedOut();
+      this.scheduleAgentSelection();
+    }, timeoutMs);
   }
 
   /**
@@ -526,19 +540,31 @@ export class Orchestrator extends EventEmitter {
     this.awaitingHumanTranscript = false;
     this.clearTranscriptFallbackTimer();
 
+    if (!text?.trim()) {
+      if (meta) {
+        logger.warn("ORCHESTRATOR", `Human transcript empty (${meta.source}): ${meta.detail}`);
+      }
+      this.lastHumanTranscript = null;
+      this.humanAddressedThisRound = false;
+      this.transitionTo("IDLE", "empty transcript");
+      const detail = meta?.detail?.trim();
+      const notice =
+        detail && /no audio|too short|silent/i.test(detail)
+          ? `STT: ${detail}`
+          : "STT: no transcript — try again";
+      this.emit("systemEvent", notice);
+      this.emit("humanTurnReady", notice);
+      return;
+    }
+
     this.lastHumanTranscript = text;
-    if (!text?.trim() && meta) {
-      logger.warn("ORCHESTRATOR", `Human transcript empty (${meta.source}): ${meta.detail}`);
-    }
-    if (text?.trim()) {
-      this.appendConversationTurn("human", "human", this.humanName, text);
-      this.recorder?.recordTurn({
-        speakerId: "human",
-        speaker: this.humanName,
-        role: "human",
-        text: text.trim(),
-      });
-    }
+    this.appendConversationTurn("human", "human", this.humanName, text);
+    this.recorder?.recordTurn({
+      speakerId: "human",
+      speaker: this.humanName,
+      role: "human",
+      text: text.trim(),
+    });
     this.humanAddressedThisRound = false;
     this.scheduleAgentSelection();
   }
@@ -548,7 +574,7 @@ export class Orchestrator extends EventEmitter {
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = null;
       void this.selectAndTriggerAgent("human_turn");
-    }, this.SILENCE_TIMEOUT_MS);
+    }, this.silenceTimeoutMs);
   }
 
   private appendConversationTurn(
@@ -800,41 +826,23 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Fallback when Gemini is unavailable: pick who the human invited to speak.
-   * Distinguishes "hear from Vikram about Priya" (Vikram) from "about Priya" alone.
+   * Deterministic server fallback when merged Gemini fails after retries.
+   * Prefers agents not on recent-speaker cooldown; tie-break by lowest speakCount.
    */
-  private resolveHumanAddressee(text: string): AgentRecord | null {
-    const mentioned = [...this.getMentionedAgents(text)];
-    const tokens = text.match(/\b[A-Za-z']+\b/g) ?? [];
-    for (const tok of tokens) {
-      for (const agent of this.agents) {
-        if (
-          agentNamesMatch(tok, agent.name) &&
-          !mentioned.some((m) => m.id === agent.id)
-        ) {
-          mentioned.push(agent);
-        }
-      }
-    }
-    if (mentioned.length === 0) return null;
+  private pickServerFallbackAgent(pool: AgentRecord[]): AgentRecord {
+    const notRecent = pool.filter((a) => !this.isOnSpeakerCooldown(a.id));
+    const candidates = notRecent.length > 0 ? notRecent : pool.filter((a) => a.id !== this.lastFinishedSpeakerId);
+    const eligible = candidates.length > 0 ? candidates : pool;
 
-    const lower = text.toLowerCase();
-    const scored = mentioned
-      .map((agent) => ({
-        agent,
-        score:
-          this.scoreInvitedToSpeak(lower, agent) * 2 +
-          this.scoreAgentAsAddressee(lower, agent),
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    const best = scored[0]!;
-    if (best.score < 12) return null;
-    if (scored.length >= 2 && best.score < scored[1]!.score + 4) return null;
-    return best.agent;
+    return [...eligible].sort((a, b) => {
+      if (a.speakCount !== b.speakCount) return a.speakCount - b.speakCount;
+      return a.id.localeCompare(b.id);
+    })[0]!;
   }
 
-  /** Clear uncommitted human audio on every agent except the one about to speak. */
+  /**
+   * Pick the next speaker via Gemini merged turn, with server fallback on failure.
+   */
   private isolateAgentInput(selected: AgentRecord): void {
     for (const agent of this.agents) {
       if (agent.id !== selected.id) {
@@ -856,44 +864,30 @@ export class Orchestrator extends EventEmitter {
     return this.recentAgentSpeakerIds.includes(agentId);
   }
 
-  /** Weighted-random fallback when Gemini is unavailable or returns "random". */
-  private pickWeightedRandom(pool: AgentRecord[]): AgentRecord {
-    const weights = pool.map((agent) => {
-      if (this.isOnSpeakerCooldown(agent.id)) return 0;
-      let w = agent.selectionWeight;
-      if (agent.id === this.lastFinishedSpeakerId) w *= 0.05;
-      return w;
-    });
-
-    let eligible = pool.filter((_, i) => weights[i]! > 0);
-    if (eligible.length === 0) {
-      eligible = pool.filter((a) => a.id !== this.lastFinishedSpeakerId);
-    }
-    if (eligible.length === 0) eligible = pool;
-
-    const eligibleWeights = eligible.map((agent) => {
-      const idx = pool.indexOf(agent);
-      const w = weights[idx]!;
-      return w > 0 ? w : 0.01;
-    });
-
-    const totalWeight = eligibleWeights.reduce((sum, w) => sum + w, 0);
-    let rand = Math.random() * totalWeight;
-    for (let i = 0; i < eligible.length; i++) {
-      rand -= eligibleWeights[i]!;
-      if (rand <= 0) return eligible[i]!;
-    }
-    return eligible[0]!;
-  }
-
-  /**
-   * Pick the next speaker: Gemini merged turn → name-match fallback → weighted random.
-   */
+  /** Clear uncommitted human audio on every agent except the one about to speak. */
   private async selectAndTriggerAgent(
     selectionContext: "human_turn" | "chain" = "human_turn"
   ): Promise<void> {
+    if (this.selectionInProgress) {
+      logger.warn(
+        "ORCHESTRATOR",
+        `Duplicate selection blocked (context=${selectionContext}, gen=${this.selectionGeneration})`
+      );
+      return;
+    }
+
+    if (this.agents.some((a) => a.session.state === "SPEAKING")) {
+      logger.warn(
+        "ORCHESTRATOR",
+        `Selection blocked — agent still generating (context=${selectionContext})`
+      );
+      return;
+    }
+
+    this.selectionInProgress = true;
     const generation = this.selectionGeneration;
 
+    try {
     if (this.agents.length === 0) {
       logger.warn("ORCHESTRATOR", "No agents registered — returning to IDLE.");
       this.transitionTo("IDLE", "no agents");
@@ -910,21 +904,11 @@ export class Orchestrator extends EventEmitter {
 
     let selectedAgent: AgentRecord | null = null;
     let selectionLabel = "";
-    let usedNamedFallback = false;
     let geminiPickReason: string | undefined;
     let preGeneratedText: string | undefined;
+    let serverFallback = false;
 
-    // Human named someone — skip merged routing; use a single response-only call.
-    if (selectionContext === "human_turn" && this.lastHumanTranscript) {
-      const named = this.resolveHumanAddressee(this.lastHumanTranscript);
-      if (named && readyAgents.some((a) => a.id === named.id)) {
-        selectedAgent = named;
-        selectionLabel = `NAMED: ${named.name} (human addressed)`;
-        usedNamedFallback = true;
-      }
-    }
-
-    if (!selectedAgent && this.routingEnabled) {
+    if (this.routingEnabled) {
       this.emit("systemEvent", `GEMINI: routing + generating response…`);
       this.recorder?.markRoutingStart(selectionContext);
       const pick = await pickSpeakerAndRespondWithGemini({
@@ -964,7 +948,7 @@ export class Orchestrator extends EventEmitter {
         }
         logger.warn(
           "ORCHESTRATOR",
-          `Gemini routed to ${this.humanName} after ${this.humanName} spoke (invalid on human_turn)${pick.reason ? ` — ${pick.reason}` : ""} — using random agent.`
+          `Gemini routed to ${this.humanName} after ${this.humanName} spoke (invalid on human_turn)${pick.reason ? ` — ${pick.reason}` : ""}`
         );
       }
 
@@ -976,12 +960,19 @@ export class Orchestrator extends EventEmitter {
           preGeneratedText = pick.response;
           selectionLabel = `GEMINI: ${agent.name}${pick.reason ? ` — ${pick.reason}` : ""}`;
         }
+      } else if (pick.source === "failed") {
+        logger.warn(
+          "ORCHESTRATOR",
+          `Merged turn failed after retries${pick.reason ? `: ${pick.reason}` : ""}`
+        );
       }
     }
 
     if (!selectedAgent) {
-      selectedAgent = this.pickWeightedRandom(readyAgents);
-      selectionLabel = `RANDOM: ${selectedAgent.name}`;
+      selectedAgent = this.pickServerFallbackAgent(readyAgents);
+      serverFallback = true;
+      selectionLabel = `SERVER_FALLBACK: ${selectedAgent.name}`;
+      logger.warn("ORCHESTRATOR", `Using server fallback speaker: ${selectedAgent.name}`);
     }
 
     if (generation !== this.selectionGeneration) return;
@@ -989,11 +980,7 @@ export class Orchestrator extends EventEmitter {
     logger.info("ORCHESTRATOR", `Selected agent: ${selectedAgent.name}`);
     this.emit("systemEvent", `SELECTED: ${selectionLabel}`);
 
-    const routingSource = selectionLabel.startsWith("GEMINI:")
-      ? "gemini"
-      : selectionLabel.startsWith("NAMED:")
-        ? "named_fallback"
-        : "random";
+    const routingSource = serverFallback ? "server_fallback" : "gemini";
     this.recorder?.recordRouting({
       context: selectionContext,
       selectedSpeakerId: selectedAgent.id,
@@ -1003,10 +990,8 @@ export class Orchestrator extends EventEmitter {
       label: selectionLabel,
     });
 
-    const routingMethod: "merged_gemini" | "named_direct" | "random" =
-      routingSource === "gemini" ? "merged_gemini"
-      : routingSource === "named_fallback" ? "named_direct"
-      : "random";
+    const routingMethod: "merged_gemini" | "server_fallback" =
+      routingSource === "gemini" ? "merged_gemini" : "server_fallback";
     this.recorder?.markRoutingResult(
       selectedAgent.id,
       selectedAgent.name,
@@ -1021,8 +1006,7 @@ export class Orchestrator extends EventEmitter {
     this.lastHumanTranscript = null;
 
     if (humanLine && selectionContext === "human_turn") {
-      this.humanAddressedThisRound =
-        usedNamedFallback || this.isDirectlyAddressed(humanLine, selectedAgent);
+      this.humanAddressedThisRound = this.isDirectlyAddressed(humanLine, selectedAgent);
     }
 
     let turnInstructions: string | undefined;
@@ -1066,6 +1050,9 @@ export class Orchestrator extends EventEmitter {
       selectionContext,
       preGeneratedText
     );
+    } finally {
+      this.selectionInProgress = false;
+    }
   }
 
   private buildMergedTurnGuidance(selectionContext: "human_turn" | "chain"): string {

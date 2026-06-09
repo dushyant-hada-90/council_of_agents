@@ -1,7 +1,7 @@
-import { GUEST_LIMITS } from "../lib/config/guestLimits";
-import { PCM16_BYTES_PER_MS } from "./agentSession";
-import { getSupabaseAdmin } from "../lib/supabase/admin";
-import { logger } from "./logger";
+import { GUEST_LIMITS } from "@/lib/config/guestLimits";
+import { PCM16_BYTES_PER_MS } from "@/lib/helpers/audio/pcm";
+import { getSupabaseAdmin } from "./admin";
+import { logger } from "@/lib/logger";
 
 export interface AudioUsageCallbacks {
   onWarning: (remainingSeconds: number) => void;

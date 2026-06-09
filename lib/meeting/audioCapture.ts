@@ -1,5 +1,9 @@
-/** Target PCM rate for human mic capture and Google STT (matches agent TTS output). */
-export const CAPTURE_SAMPLE_RATE = 24000;
+export {
+  CAPTURE_SAMPLE_RATE,
+  DEFAULT_HUMAN_STT_SEGMENT_BYTES,
+  pcm16DurationSec,
+  getHumanSttSegmentBytes,
+} from "@/lib/helpers/audio/pcm";
 
 /** Downsample mono float32 PCM (linear interpolation). */
 export function downsampleFloat32(

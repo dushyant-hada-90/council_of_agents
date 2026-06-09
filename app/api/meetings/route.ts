@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getEnv } from "@/lib/env";
 import { requireUser, getDb } from "@/lib/supabase/server";
 
 export async function GET() {
@@ -32,7 +33,7 @@ export async function POST(request: NextRequest) {
         goal: body.goal ?? "",
         context: body.context ?? "",
         instructions: body.instructions ?? "",
-        max_ai_turns_before_human: body.max_ai_turns_before_human ?? 4,
+        max_ai_turns_before_human: getEnv().MAX_AI_TURNS_BEFORE_HUMAN,
         status: "scheduled",
       })
       .select()

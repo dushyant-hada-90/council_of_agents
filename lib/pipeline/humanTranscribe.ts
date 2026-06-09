@@ -1,5 +1,5 @@
-import { transcribePcm16 } from "./google/stt";
-import { logger } from "./logger";
+import { transcribePcm16 } from "./stt";
+import { logger } from "@/lib/logger";
 
 export type HumanTranscriptSource = "google" | "none" | "error";
 

@@ -13,10 +13,15 @@ import {
   CAPTURE_SAMPLE_RATE,
   downsampleFloat32,
   float32ToPcm16,
+  pcm16DurationSec,
 } from "@/lib/meeting/audioCapture";
 
 const SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
-const PLAYBACK_BUFFER_AHEAD_S = 0.05;
+const ROLLING_STT_SEGMENT_SEC = 30;
+/** Lookahead for chained chunks (already queued in the schedule). */
+const PLAYBACK_BUFFER_AHEAD_S = 0.20;
+/** Extra lookahead for the very first chunk of a new turn (cold-start). */
+const PLAYBACK_COLD_START_S = 0.35;
 
 interface AgentMeta {
   id: string;
@@ -68,12 +73,16 @@ export function MeetingRoom({
   const [displayLines, setDisplayLines] = useState<TranscriptDisplayLine[]>([]);
   const [speakingAgentId, setSpeakingAgentId] = useState<string | null>(null);
   const [isPTTActive, setIsPTTActive] = useState(false);
+  const [pttDurationSec, setPttDurationSec] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [sttNotice, setSttNotice] = useState<string | null>(null);
   const [humanTurnReady, setHumanTurnReady] = useState(false);
   const [engagementHint, setEngagementHint] = useState<string | null>(null);
   const [meetingEnded, setMeetingEnded] = useState(false);
   const [audioLimitWarning, setAudioLimitWarning] = useState<number | null>(null);
   const [audioLimitEnded, setAudioLimitEnded] = useState(false);
   const [endReason, setEndReason] = useState<string | null>(null);
+  const [audioCtxSuspended, setAudioCtxSuspended] = useState(false);
   const transcriptEngineRef = useRef(new PlayoutTranscriptEngine());
   const lastHeardAgentRef = useRef<string | null>(null);
   const lastDisplayStatusRef = useRef("Idle");
@@ -190,6 +199,9 @@ export function MeetingRoom({
   const playoutEpochRef = useRef(0);
   const playoutBlockedRef = useRef(false);
   const isPTTActiveRef = useRef(false);
+  const pttBytesRef = useRef(0);
+  const isTranscribingRef = useRef(false);
+  const awaitingHumanTranscriptRef = useRef(false);
   const connectedRef = useRef(false);
   const agentsRef = useRef<AgentMeta[]>(initialAgents);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
@@ -235,8 +247,14 @@ export function MeetingRoom({
       setEngagementHint(engagementLabel);
     }
 
+    if (isPTTActiveRef.current) {
+      const sec = Math.floor(pcm16DurationSec(pttBytesRef.current));
+      setPttDurationSec((prev) => (prev === sec ? prev : sec));
+    }
+
     const status = deriveDisplayStatus({
       isPTTActive: isPTTActiveRef.current,
+      isTranscribing: isTranscribingRef.current,
       humanName,
       heardAgentName: heard ? (getAgentMeta(heard)?.name ?? null) : null,
       humanTurnReady: turnReady,
@@ -463,6 +481,10 @@ export function MeetingRoom({
         const text = msg.text as string;
         const partial = msg.partial as boolean | undefined;
         if (agentId === "human") {
+          awaitingHumanTranscriptRef.current = false;
+          isTranscribingRef.current = false;
+          setIsTranscribing(false);
+          setSttNotice(null);
           transcriptEngineRef.current.addHumanLine(agentId, agentName, text, agentColor("human"));
           setDisplayLines(transcriptEngineRef.current.getDisplayLines());
         } else {
@@ -479,9 +501,26 @@ export function MeetingRoom({
         }
         break;
       }
-      case "HUMAN_TURN_READY":
+      case "HUMAN_TURN_READY": {
+        const sttNoticeMsg = msg.sttNotice as string | undefined;
+        if (awaitingHumanTranscriptRef.current) {
+          awaitingHumanTranscriptRef.current = false;
+          isTranscribingRef.current = false;
+          setIsTranscribing(false);
+          if (sttNoticeMsg) {
+            const friendly = sttNoticeMsg.replace(/^STT:\s*/i, "");
+            setSttNotice(
+              /no audio|too short|silent/i.test(friendly)
+                ? friendly.charAt(0).toUpperCase() + friendly.slice(1)
+                : "We couldn't transcribe that — please try again."
+            );
+          } else {
+            setSttNotice(null);
+          }
+        }
         pendingHumanTurnRef.current = true;
         break;
+      }
       case "HUMAN_INVITED": {
         const agentId = msg.agentId as string;
         pendingHumanTurnRef.current = false;
@@ -513,7 +552,11 @@ export function MeetingRoom({
 
     const ctx = audioCtxRef.current;
     if (!ctx) return;
-    if (ctx.state === "suspended") void ctx.resume();
+    if (ctx.state === "suspended") {
+      setAudioCtxSuspended(true);
+      return; // drop frame — will replay once user gesture resumes ctx
+    }
+    setAudioCtxSuspended(false);
 
     const agentId = agentsRef.current[agentIndex]?.id ?? null;
     const agentName = agentsRef.current[agentIndex]?.name ?? agentId ?? "Agent";
@@ -536,7 +579,12 @@ export function MeetingRoom({
 
     const sourceDurationSec = buffer.duration;
     const now = ctx.currentTime;
-    const start = Math.max(now + PLAYBACK_BUFFER_AHEAD_S, nextPlayTimeRef.current || now + PLAYBACK_BUFFER_AHEAD_S);
+    // Use the larger cold-start buffer when there is no already-scheduled audio
+    // ahead of now (i.e. first chunk of a new agent turn). This compensates for
+    // Windows audio hardware latency which can exceed the normal 200 ms lookahead.
+    const isColdStart = (nextPlayTimeRef.current || 0) <= now;
+    const aheadS = isColdStart ? PLAYBACK_COLD_START_S : PLAYBACK_BUFFER_AHEAD_S;
+    const start = Math.max(now + aheadS, nextPlayTimeRef.current || now + aheadS);
 
     try {
       source.start(start);
@@ -573,7 +621,26 @@ export function MeetingRoom({
   }
 
   async function initAudio() {
-    audioCtxRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
+    const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    audioCtxRef.current = ctx;
+
+    // Browsers suspend AudioContext on pages that load without a prior user gesture.
+    // Register a one-shot handler on any gesture so we can resume immediately and
+    // clear the "Click to enable audio" banner.
+    if (ctx.state === "suspended") {
+      setAudioCtxSuspended(true);
+      const resume = () => {
+        void ctx.resume().then(() => {
+          if (ctx.state === "running") setAudioCtxSuspended(false);
+        });
+        document.removeEventListener("click", resume, true);
+        document.removeEventListener("keydown", resume, true);
+        document.removeEventListener("touchstart", resume, true);
+      };
+      document.addEventListener("click", resume, true);
+      document.addEventListener("keydown", resume, true);
+      document.addEventListener("touchstart", resume, true);
+    }
     captureSampleRateRef.current = audioCtxRef.current.sampleRate;
     if (captureSampleRateRef.current !== SAMPLE_RATE) {
       console.warn(
@@ -605,6 +672,7 @@ export function MeetingRoom({
           ? input
           : downsampleFloat32(input, captureRate, SAMPLE_RATE);
       const pcm16 = float32ToPcm16(samples);
+      pttBytesRef.current += pcm16.byteLength;
       wsRef.current.send(pcm16.buffer);
     };
 
@@ -622,7 +690,10 @@ export function MeetingRoom({
     stopPlayback();
 
     isPTTActiveRef.current = true;
+    pttBytesRef.current = 0;
+    setPttDurationSec(0);
     setIsPTTActive(true);
+    setSttNotice(null);
     pendingHumanTurnRef.current = false;
     humanTurnReadyRef.current = false;
     setHumanTurnReady(false);
@@ -639,6 +710,9 @@ export function MeetingRoom({
     if (!isPTTActiveRef.current) return;
     isPTTActiveRef.current = false;
     setIsPTTActive(false);
+    awaitingHumanTranscriptRef.current = true;
+    isTranscribingRef.current = true;
+    setIsTranscribing(true);
     wsRef.current?.send(
       JSON.stringify({
         type: "END_SPEECH",
@@ -695,6 +769,13 @@ export function MeetingRoom({
         <p className="text-sm text-gray-400 border-l-2 border-accent pl-3">{refinedPrompt}</p>
       )}
 
+      {audioCtxSuspended && (
+        <div className="bg-blue-950/60 border border-blue-700 text-blue-200 px-4 py-2 rounded-lg text-sm flex items-center gap-2">
+          <span>🔇</span>
+          <span>Click anywhere or press a key to enable audio.</span>
+        </div>
+      )}
+
       {audioLimitWarning !== null && !audioLimitEnded && (
         <div className="bg-yellow-900/40 border border-yellow-700 text-yellow-200 px-4 py-3 rounded-lg text-sm">
           About {Math.ceil(audioLimitWarning / 60)} minute{audioLimitWarning >= 120 ? "s" : ""} of free audio remaining.
@@ -738,6 +819,9 @@ export function MeetingRoom({
       </div>
 
       {error && <p className="text-red-400">{error}</p>}
+      {sttNotice && !isTranscribing && (
+        <p className="text-yellow-400 text-sm">{sttNotice}</p>
+      )}
 
       {meetingEnded && !connected && (
         <p className="text-yellow-400 text-sm">
@@ -750,7 +834,15 @@ export function MeetingRoom({
         <div className="card text-center border-blue-500/50">
           <p className="font-medium">{humanName}</p>
           <p className="text-xs text-gray-400">You</p>
-          {isPTTActive && <p className="text-green-400 text-xs mt-1">Speaking</p>}
+          {isPTTActive && (
+            <p className="text-green-400 text-xs mt-1">
+              Speaking{pttDurationSec > 0 ? ` · ${pttDurationSec}s` : ""}
+              {pttDurationSec >= ROLLING_STT_SEGMENT_SEC ? " · transcribing in background" : ""}
+            </p>
+          )}
+          {isTranscribing && !isPTTActive && (
+            <p className="text-blue-300 text-xs mt-1">Transcribing…</p>
+          )}
           {humanTurnReady && !isPTTActive && (
             <p className="text-yellow-400 text-xs mt-1">Your turn — hold to speak</p>
           )}
@@ -786,7 +878,11 @@ export function MeetingRoom({
           } disabled:opacity-50`}
         >
           {isPTTActive
-            ? "Release to send"
+            ? pttDurationSec > 0
+              ? `Release to send (${pttDurationSec}s)`
+              : "Release to send"
+            : isTranscribing
+              ? "Transcribing…"
             : humanTurnReady
               ? "Your turn — hold to speak (Space)"
               : "Hold to speak (Space)"}

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import type { AgentRow } from "@/lib/types/database";
+import type { AgentRow } from "@/lib/supabase/types";
 import { GOOGLE_TTS_VOICES, normalizeVoice } from "@/lib/agents/types";
 
 interface AgentFormProps {

@@ -1,7 +1,8 @@
 import { TextToSpeechClient } from "@google-cloud/text-to-speech";
-import { normalizeGoogleVoice } from "../../lib/agents/types";
-import { getEnv } from "../../lib/env";
-import { logger } from "../logger";
+import { normalizeGoogleVoice } from "@/lib/agents/types";
+import { getEnv } from "@/lib/env";
+import { logger } from "@/lib/logger";
+import { logApiError, logApiRequest, logApiResponse, previewText } from "@/lib/logger/apiLog";
 import { stripWavHeaderIfPresent } from "./wav";
 
 let client: TextToSpeechClient | null = null;
@@ -32,7 +33,19 @@ export async function synthesizeSpeech(
   const trimmed = text.trim();
   if (!trimmed) return Buffer.alloc(0);
 
+  if (trimmed.length > 4000) {
+    logger.warn(
+      "TTS",
+      `Input text is ${trimmed.length} chars — Google TTS has a 5000 byte limit; response may truncate`
+    );
+  }
+
   const voiceName = normalizeGoogleVoice(options.voice);
+  const reqStarted = logApiRequest(
+    "TTS",
+    "synthesizeSpeech",
+    `voice=${voiceName}, ${trimmed.length} chars, "${previewText(trimmed, 60)}"`
+  );
 
   try {
     const [response] = await getClient().synthesizeSpeech({
@@ -50,6 +63,7 @@ export async function synthesizeSpeech(
 
     const content = response.audioContent;
     if (!content || (!(content instanceof Uint8Array) && typeof content !== "string")) {
+      logApiResponse("TTS", reqStarted, "synthesizeSpeech", "empty audioContent");
       return Buffer.alloc(0);
     }
 
@@ -58,23 +72,22 @@ export async function synthesizeSpeech(
       : Buffer.from(content as string | Uint8Array);
 
     const { pcm, hadWavHeader } = stripWavHeaderIfPresent(buf);
-    if (hadWavHeader) {
-      logger.info(
-        "TTS",
-        `Stripped WAV header (${buf.byteLength - pcm.byteLength} bytes) → raw PCM ${pcm.byteLength} bytes for ${voiceName}`
-      );
-    } else {
-      logger.info("TTS", `Synthesized ${pcm.byteLength} bytes raw PCM for voice ${voiceName}`);
-    }
+    const durationSec = (pcm.byteLength / (SAMPLE_RATE * 2)).toFixed(1);
+    logApiResponse(
+      "TTS",
+      reqStarted,
+      "synthesizeSpeech",
+      `${pcm.byteLength}B PCM (~${durationSec}s)${hadWavHeader ? ", wav stripped" : ""}`
+    );
     return pcm;
   } catch (err) {
-    logger.error("TTS", `Google TTS failed: ${(err as Error).message}`);
+    logApiError("TTS", reqStarted, "synthesizeSpeech", (err as Error).message);
     throw err;
   }
 }
 
-/** Split PCM buffer into base64 chunks for streaming to client (~20ms each). */
-export function pcmToBase64Chunks(pcm: Buffer, chunkMs = 20): string[] {
+/** Split PCM buffer into base64 chunks for streaming to client (~40ms each). */
+export function pcmToBase64Chunks(pcm: Buffer, chunkMs = 40): string[] {
   const bytesPerChunk = Math.floor(SAMPLE_RATE * 2 * (chunkMs / 1000));
   const chunks: string[] = [];
   for (let i = 0; i < pcm.byteLength; i += bytesPerChunk) {

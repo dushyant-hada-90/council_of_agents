@@ -1,15 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
+import { getEnv } from "@/lib/env";
 import { getDb } from "@/lib/supabase/server";
-import { rateLimit } from "@/lib/rate-limit";
+import { rateLimit } from "@/lib/helpers/rate-limit";
 import { getClientIp, getOrCreateGuestSessionId } from "@/lib/guest/session";
 import {
   GUEST_SESSION_COOKIE,
   guestSessionCookieOptions,
   signGuestToken,
 } from "@/lib/auth/token";
-import { isGuestIpOverLimit } from "@/server/audioUsageTracker";
-import type { AgentSnapshot } from "@/lib/types/database";
+import { isGuestIpOverLimit } from "@/lib/supabase/audioUsageTracker";
+import type { AgentSnapshot } from "@/lib/supabase/types";
 
 interface CreateGuestMeetingBody {
   originalPrompt: string;
@@ -45,8 +46,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  if (!body.agents?.length || body.agents.length < 4) {
-    return NextResponse.json({ error: "At least 4 agents required." }, { status: 400 });
+  const minAgents = getEnv().GUEST_MIN_AGENTS;
+
+  if (!body.agents?.length || body.agents.length < minAgents) {
+    return NextResponse.json(
+      { error: `At least ${minAgents} agents required.` },
+      { status: 400 }
+    );
   }
 
   const cookieStore = await cookies();
@@ -69,7 +75,7 @@ export async function POST(request: NextRequest) {
       goal: body.goal ?? "",
       context: body.context ?? "",
       instructions: body.instructions ?? "",
-      max_ai_turns_before_human: 4,
+      max_ai_turns_before_human: getEnv().MAX_AI_TURNS_BEFORE_HUMAN,
       status: "scheduled",
     } as never)
     .select("id")

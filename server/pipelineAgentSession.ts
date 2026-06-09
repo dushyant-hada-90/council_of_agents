@@ -1,9 +1,10 @@
 import { EventEmitter } from "events";
 import type { AgentConfig } from "../lib/agents/types";
 import { buildMeetingRoster } from "../lib/agents/roster";
-import { generateAgentResponse, type ChatMessage } from "./google/geminiChat";
-import { synthesizeSpeech, pcmToBase64Chunks } from "./google/tts";
-import { logger } from "./logger";
+import { splitIntoSpeechChunks } from "../lib/helpers/text/sentenceSplit";
+import { generateAgentResponse, type ChatMessage } from "../lib/pipeline/geminiChat";
+import { synthesizeSpeech, pcmToBase64Chunks } from "../lib/pipeline/tts";
+import { logger } from "../lib/logger";
 import { PCM16_BYTES_PER_MS, type SessionState, type AgentSession, type PipelineHooks } from "./agentSession";
 
 /**
@@ -131,8 +132,30 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
       this.emit("transcriptDone", text, this.agentId);
 
       hooks?.onTtsStart();
-      const pcm = await synthesizeSpeech(text, { voice: this.config.voice });
-      hooks?.onTtsEnd(pcm.byteLength);
+      const speechChunks = splitIntoSpeechChunks(text);
+      let totalPcmBytes = 0;
+      let isFirstAudio = true;
+
+      for (const sentence of speechChunks) {
+        if (signal.aborted || this.isDestroyed) break;
+
+        const pcm = await synthesizeSpeech(sentence, { voice: this.config.voice });
+        totalPcmBytes += pcm.byteLength;
+
+        if (signal.aborted || this.isDestroyed) break;
+
+        const chunks = pcmToBase64Chunks(pcm);
+        for (const chunk of chunks) {
+          if (signal.aborted || this.isDestroyed) break;
+          if (isFirstAudio) {
+            hooks?.onFirstAudioSent();
+            isFirstAudio = false;
+          }
+          this.emit("audioDelta", chunk, this.agentId);
+        }
+      }
+
+      hooks?.onTtsEnd(totalPcmBytes);
 
       if (signal.aborted || this.isDestroyed) {
         hooks?.onDone("cancelled");
@@ -140,24 +163,16 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
         return;
       }
 
-      this.currentResponseAudioBytes = pcm.byteLength;
-      this.lastCompletedAudioBytes = pcm.byteLength;
+      this.currentResponseAudioBytes = totalPcmBytes;
+      this.lastCompletedAudioBytes = totalPcmBytes;
 
-      const chunks = pcmToBase64Chunks(pcm);
-      let isFirst = true;
-      for (const chunk of chunks) {
-        if (signal.aborted || this.isDestroyed) break;
-        if (isFirst) {
-          hooks?.onFirstAudioSent();
-          isFirst = false;
-        }
-        this.emit("audioDelta", chunk, this.agentId);
-      }
-      if (!isFirst) {
+      if (!isFirstAudio) {
         hooks?.onLastAudioSent();
       }
 
-      this.conversationHistory.push({ role: "model", text });
+      if (text.trim()) {
+        this.conversationHistory.push({ role: "model", text });
+      }
 
       this.state = "READY";
       hooks?.onDone("completed");

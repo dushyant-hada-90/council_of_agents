@@ -3,7 +3,7 @@
  *
  * Usage:
  *   npm run s3:create-bucket
- *   npx tsx scripts/create-s3-bucket.ts
+ *   npx tsx scripts/s3/create-s3-bucket.ts
  */
 import "dotenv/config";
 import {

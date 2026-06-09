@@ -29,28 +29,28 @@ Browser (Next.js — MeetingRoom, push-to-talk)
     │  REST (/api/*)  +  WebSocket (ws://host/ws)
     ▼
 server.ts
-    ├── Next.js App Router (UI + API routes)
-    ├── wsServer.ts          — auth, meeting join, message routing
-    ├── roomManager.ts       — one ConferenceRoom per meeting
-    │     ├── orchestrator.ts    — IDLE → HUMAN_SPEAKING → DECIDING → AGENT_SPEAKING FSM
-    │     ├── pipelineAgentSession.ts  — per-agent session (one per advisor)
-    │     ├── audioMixer.ts      — mix-minus routing to agents
-    │     └── humanTranscribe.ts — buffers human PCM → Google STT
-    ├── google/stt.ts        — human speech-to-text
-    ├── google/geminiChat.ts — agent replies + merged turn routing
-    ├── google/tts.ts        — agent speech synthesis
-    ├── nextSpeakerRouter.ts — merged pick+respond, chain-continue decisions
-    ├── transcriptPersister.ts → Supabase Postgres
-    └── s3AudioUploader.ts   → AWS S3
+    ├── Next.js App Router (app/, components/)
+    └── server/ — conference runtime (WebSocket + FSM)
+          ├── wsServer.ts, roomManager.ts, orchestrator.ts
+          ├── pipelineAgentSession.ts, audioMixer.ts
+          └── sessionRecorder.ts
+
+lib/ — shared domain modules
+    ├── pipeline/     — STT, Gemini chat, TTS, routing, human transcribe
+    ├── supabase/     — admin client, transcript persister, audio usage, types
+    ├── s3/           — S3 client + meeting audio uploader
+    ├── logger/       — structured logging + API/chat model error logs
+    ├── helpers/      — name matching, playout epoch, PCM constants, rate limit
+    ├── auth/, agents/, config/, meeting/, guest/, env.ts
+    └── (supabase/migrations/ at repo root for SQL schema)
 ```
 
 ### Per-agent turn (pipeline)
 
-1. **Human stops talking** → PCM16 audio buffered server-side.
-2. **Google STT** transcribes the human line (`server/google/stt.ts`).
-3. **Gemini merged call** (`pickSpeakerAndRespond`) chooses the next agent and writes their spoken reply in one request. If the human named someone directly, a single `generateAgentResponse` call is used instead.
-4. **Google TTS** synthesizes the reply (`server/google/tts.ts`).
-5. Audio streams to the browser over WebSocket; transcript text syncs to the UI.
+1. **Human stops talking** → rolling 30s STT segments merge into one transcript (`lib/pipeline/humanSegmentTranscriber.ts`).
+2. **Gemini merged call** (`pickSpeakerAndRespond`) picks the next agent and writes their reply in one JSON request (2 retries; deterministic server fallback if Gemini fails).
+3. **Google TTS** synthesizes reply **sentence-by-sentence** for faster first audio (`lib/pipeline/tts.ts`, `lib/helpers/text/sentenceSplit.ts`).
+4. Audio streams to the browser over WebSocket; transcript text syncs to the UI.
 
 Chain reactions (agent-to-agent turns after the human spoke) use the same pipeline. A separate small Gemini call decides whether the chain should continue.
 
@@ -92,9 +92,7 @@ Required variables (see `.env.example` for defaults):
 |----------|---------|
 | `GCP_PROJECT_ID` | Google Cloud project for Vertex Gemini |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP service account JSON (STT, TTS, Gemini) |
-| `GEMINI_CHAT_MODEL` | Gemini model for agent replies and merged turns |
-| `GEMINI_ROUTING_MODEL` | Gemini model for chain-continue decisions |
-| `GEMINI_PLANNER_MODEL` | Gemini model for guest agent planning |
+| `GEMINI_PLANNER_MODEL` | Gemini model for guest agent planning (voice pipeline uses `gemini-3.5-flash` via Vertex publisher API) |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` | S3 audio storage |
 | `AUTH_SECRET` | JWT signing secret (≥32 chars) |
 | `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Postgres access |
@@ -155,20 +153,21 @@ The Docker image runs `node dist/server.js` (see `Dockerfile`).
 app/              Next.js pages and API routes
 components/       React UI (MeetingRoom, AgentForm, landing flow)
 lib/
+  pipeline/       STT, Gemini chat, TTS, routing, human transcribe
+  supabase/       Admin client, transcript persister, audio usage, DB types
+  s3/             S3 client + meeting audio uploader
+  logger/         Structured logging, API logs, Gemini error artifacts
+  helpers/        Name matching, playout epoch, PCM constants, rate limit
   agents/         Agent types, roster builder
   auth/           JWT sessions, password hashing
   config/         Pipeline tuning, guest limits, suggested prompts
+  meeting/        Browser audio capture and playout helpers
   env.ts          Validated environment schema
-server/
-  google/         stt.ts, geminiChat.ts, tts.ts
-  orchestrator.ts Turn-taking FSM
-  pipelineAgentSession.ts  STT→Gemini→TTS per agent
-  roomManager.ts  Meeting lifecycle
-  wsServer.ts     WebSocket gateway
+server/           Conference runtime (WebSocket, FSM, agent sessions)
+  orchestrator.ts, roomManager.ts, wsServer.ts, pipelineAgentSession.ts, …
 server.ts         HTTP + Next.js + WebSocket entry point
-supabase/
-  schema.sql      Canonical database schema
-scripts/          S3 utilities
+supabase/         SQL schema and migrations (Supabase CLI)
+scripts/s3/       S3 ops CLI (list, play, bucket management)
 ```
 
 ---

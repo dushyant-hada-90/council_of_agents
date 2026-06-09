@@ -38,12 +38,14 @@ export function hasQueuedAudioAfter(
 
 export function deriveDisplayStatus(options: {
   isPTTActive: boolean;
+  isTranscribing?: boolean;
   humanName: string;
   heardAgentName: string | null;
   humanTurnReady: boolean;
   queueBusy: boolean;
 }): string {
   if (options.isPTTActive) return `${options.humanName} is speaking`;
+  if (options.isTranscribing) return "Transcribing…";
   if (options.heardAgentName) return `${options.heardAgentName} is speaking`;
   if (options.humanTurnReady) return "Your turn";
   if (options.queueBusy) return "Listening…";

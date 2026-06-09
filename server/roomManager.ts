@@ -6,12 +6,14 @@ import type { AgentSession } from "./agentSession";
 import { AudioMixer } from "./audioMixer";
 import { Orchestrator, InterruptPlaybackReport } from "./orchestrator";
 import { SessionRecorder } from "./sessionRecorder";
-import { TranscriptPersister, registerPersister, unregisterPersister } from "./transcriptPersister";
-import { AudioUsageTracker } from "./audioUsageTracker";
-import { S3AudioUploader, setMeetingS3Prefix } from "./s3AudioUploader";
-import { logger } from "./logger";
-import { bumpPlayoutEpoch, getPlayoutEpoch, resetPlayoutEpoch } from "./playoutEpoch";
-import { resolveHumanTranscript, type HumanTranscriptMeta } from "./humanTranscribe";
+import { TranscriptPersister, registerPersister, unregisterPersister } from "../lib/supabase/transcriptPersister";
+import { AudioUsageTracker } from "../lib/supabase/audioUsageTracker";
+import { S3AudioUploader, setMeetingS3Prefix } from "../lib/s3/audioUploader";
+import { logger } from "../lib/logger";
+import { bumpPlayoutEpoch, getPlayoutEpoch, resetPlayoutEpoch } from "../lib/helpers/playoutEpoch";
+import { estimateFinalSttTimeoutMs } from "../lib/pipeline/stt";
+import { HumanSegmentTranscriber } from "../lib/pipeline/humanSegmentTranscriber";
+import type { HumanTranscriptMeta } from "../lib/pipeline/humanTranscribe";
 import { getSupabaseAdmin } from "../lib/supabase/admin";
 import { getEnv } from "../lib/env";
 import { PCM16_BYTES_PER_MS } from "./agentSession";
@@ -42,7 +44,7 @@ export class ConferenceRoom {
   private client: RoomClient | null = null;
   private pendingAudioLimitEnd = false;
 
-  private humanAudioChunks: Buffer[] = [];
+  private humanSegmentTranscriber: HumanSegmentTranscriber | null = null;
   private humanTranscriptDelivered = false;
   private humanTranscriptStatus = "idle";
   private readonly idleTimeoutMs: number;
@@ -211,8 +213,8 @@ export class ConferenceRoom {
       this.sendToClient({ type: "HUMAN_INVITED", agentId, agentName, timestamp: Date.now() });
     });
 
-    this.orchestrator.on("humanTurnReady", () => {
-      this.sendToClient({ type: "HUMAN_TURN_READY", timestamp: Date.now() });
+    this.orchestrator.on("humanTurnReady", (sttNotice?: string) => {
+      this.sendToClient({ type: "HUMAN_TURN_READY", timestamp: Date.now(), sttNotice });
     });
   }
 
@@ -376,7 +378,7 @@ export class ConferenceRoom {
       if (this.audioUsage?.shouldBlockNewTurns()) return;
       this.touchActivity();
       const audioBuf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      this.humanAudioChunks.push(audioBuf);
+      this.humanSegmentTranscriber?.appendChunk(audioBuf);
       this.audioUsage?.addHumanAudio(audioBuf.byteLength);
       this.s3Uploader.appendPcm("human", "human", audioBuf);
       this.mixer.routeHumanAudio(audioBuf);
@@ -394,12 +396,16 @@ export class ConferenceRoom {
       case "START_SPEECH": {
         if (this.audioUsage?.shouldBlockNewTurns()) return;
         this.touchActivity();
-        this.humanAudioChunks = [];
+        this.humanSegmentTranscriber?.abort();
+        this.humanSegmentTranscriber = null;
         this.humanTranscriptDelivered = false;
         const report = event.playbackReport as InterruptPlaybackReport | undefined;
         const newEpoch = bumpPlayoutEpoch();
         this.sessionRecorder.markPttStart();
         this.orchestrator.onHumanSpeechStart(report, newEpoch);
+        this.humanSegmentTranscriber = new HumanSegmentTranscriber({
+          onFirstSegmentSubmit: () => this.sessionRecorder.markSttSubmit(),
+        });
         break;
       }
       case "END_SPEECH": {
@@ -408,14 +414,17 @@ export class ConferenceRoom {
           return;
         }
         this.touchActivity();
-        const chunks = this.humanAudioChunks.splice(0);
-        this.humanAudioChunks = [];
-        const byteCount = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-        this.sessionRecorder.markPttEnd(chunks.length, byteCount);
-        this.orchestrator.onHumanSpeechEnd();
-        this.humanTranscriptStatus = `awaiting Google STT (${chunks.length} chunks, ${byteCount} bytes)`;
+        const transcriber = this.humanSegmentTranscriber;
+        this.humanSegmentTranscriber = null;
+        const byteCount = transcriber?.bytesReceived ?? 0;
+        const chunkCount = transcriber?.chunkCount ?? 0;
+        this.sessionRecorder.markPttEnd(chunkCount, byteCount);
+        this.orchestrator.onHumanSpeechEnd(
+          estimateFinalSttTimeoutMs(getEnv().HUMAN_STT_TIMEOUT_MS)
+        );
+        this.humanTranscriptStatus = `awaiting Google STT (${chunkCount} chunks, ${byteCount} bytes)`;
 
-        if (chunks.length === 0) {
+        if (!transcriber || byteCount === 0) {
           this.sessionRecorder.markSttResult(null, "none", "no audio chunks captured on END_SPEECH");
           this.deliverHumanTranscript(null, {
             source: "none",
@@ -424,10 +433,8 @@ export class ConferenceRoom {
           break;
         }
 
-        this.sessionRecorder.markSttSubmit();
-        const captureSampleRate =
-          typeof event.captureSampleRate === "number" ? event.captureSampleRate : undefined;
-        void resolveHumanTranscript(chunks, { captureSampleRate })
+        void transcriber
+          .finalize()
           .then((result) => {
             this.humanTranscriptStatus = result.meta.detail;
             this.sessionRecorder.markSttResult(
