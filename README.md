@@ -48,7 +48,7 @@ lib/ — shared domain modules
 ### Per-agent turn (pipeline)
 
 1. **Human stops talking** → rolling 30s STT segments merge into one transcript (`lib/pipeline/humanSegmentTranscriber.ts`).
-2. **Gemini merged call** (`pickSpeakerAndRespond`) picks the next agent and writes their reply in one JSON request (2 retries; deterministic server fallback if Gemini fails).
+2. **Gemini merged call** (`pickSpeakerAndRespond`) picks the next agent and writes their reply in one JSON request (2 retries; on failure the human is invited to speak).
 3. **Google TTS** synthesizes reply **sentence-by-sentence** for faster first audio (`lib/pipeline/tts.ts`, `lib/helpers/text/sentenceSplit.ts`).
 4. Audio streams to the browser over WebSocket; transcript text syncs to the UI.
 

@@ -7,7 +7,7 @@ export type SessionState = "CONNECTING" | "READY" | "SPEAKING" | "CLOSED";
  * Captured by SessionRecorder to build the per-turn latency breakdown.
  */
 export interface PipelineHooks {
-  /** Called immediately before the Gemini chat request (skipped when response is pre-generated). */
+  /** Called immediately before the Gemini chat request (unused — all speech is pre-generated). */
   onGeminiStart(): void;
   /** Called when Gemini returns the spoken text. */
   onGeminiEnd(text: string): void;
@@ -34,10 +34,7 @@ export interface AgentSession extends EventEmitter {
   clearAudioBuffer(): void;
   injectTableSpeech(speakerLabel: string, text: string): void;
   commitAudioBuffer(): boolean;
-  triggerResponse(
-    extraInstructions?: string,
-    options?: { preGeneratedText?: string; hooks?: PipelineHooks }
-  ): void;
+  triggerResponse(options: { preGeneratedText: string; hooks?: PipelineHooks }): void;
   cancelResponse(): void;
   forceCancelResponse(): void;
   rollbackAssistantAudio(mode: "delete" | "truncate", audioEndMs?: number): void;

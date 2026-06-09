@@ -3,14 +3,10 @@ import {
   getHumanSttOverlapBytes,
   getHumanSttSegmentBytes,
   getHumanSttStrideBytes,
-  pcm16DurationSec,
 } from "@/lib/helpers/audio/pcm";
-import { getEnv } from "@/lib/env";
 import { logger } from "@/lib/logger";
-import { transcribePcm16, cleanupSttTranscript } from "./stt";
+import { transcribePcm16 } from "./stt";
 import type { HumanTranscriptMeta } from "./humanTranscribe";
-
-const STT_CLEANUP_MIN_DURATION_SEC = 10;
 
 export interface HumanSegmentTranscriberOptions {
   onFirstSegmentSubmit?: () => void;
@@ -92,9 +88,7 @@ export class HumanSegmentTranscriber {
     }
 
     try {
-      const result = await transcribePcm16([segmentPcm], {
-        skipGeminiCleanup: true,
-      });
+      const result = await transcribePcm16([segmentPcm], {});
       if (result.text?.trim()) {
         logger.info("TRANSCRIBE", `Segment ${index} OK (${segmentPcm.byteLength}B)`);
         return result.text.trim();
@@ -134,14 +128,6 @@ export class HumanSegmentTranscriber {
         text: null,
         meta: { source: "none", detail: "merged transcript empty" },
       };
-    }
-
-    const durationSec = pcm16DurationSec(this.totalBytesReceived);
-    if (
-      durationSec > STT_CLEANUP_MIN_DURATION_SEC &&
-      getEnv().GEMINI_STT_CLEANUP
-    ) {
-      merged = await cleanupSttTranscript(merged);
     }
 
     return {

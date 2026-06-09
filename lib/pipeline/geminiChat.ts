@@ -1,5 +1,12 @@
 import { getEnv } from "@/lib/env";
 import { CHAT_TUNING } from "@/lib/config/pipeline";
+import {
+  appendChatVoiceRules,
+  buildLiveTurnPrompt,
+  formatLiveMeetingMetadata,
+  JSON_SYSTEM_SUFFIX,
+  type LiveMeetingMetadata,
+} from "@/lib/prompts/prompts";
 import { logger } from "@/lib/logger";
 import { logApiError, logApiRequest, logApiResponse, previewText } from "@/lib/logger/apiLog";
 import {
@@ -8,9 +15,10 @@ import {
   type ChatModelOperation,
 } from "@/lib/logger/chatModelLog";
 
+const GOOGLE_SEARCH_TOOLS = [{ googleSearch: {} }] as const;
+
 const API_ENDPOINT = "aiplatform.googleapis.com";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
-const JSON_SYSTEM_SUFFIX = "Respond with valid JSON only. No explanation, no markdown.";
 
 function getChatModel(override?: string): string {
   return override ?? getEnv().GEMINI_CHAT_MODEL ?? DEFAULT_GEMINI_MODEL;
@@ -30,6 +38,7 @@ type GeminiGenerateBody = {
   systemInstruction?: { parts: Array<{ text: string }> };
   generationConfig: Record<string, unknown>;
   safetySettings: typeof SAFETY_SETTINGS;
+  tools?: Array<{ googleSearch: Record<string, never> }>;
 };
 
 type GeminiErrorPayload = {
@@ -188,17 +197,31 @@ function userOnlyContents(userText: string): Content[] {
   return [{ role: "user", parts: [{ text: userText }] }];
 }
 
+function googleSearchGroundingEnabled(operation: ChatModelOperation): boolean {
+  const env = getEnv();
+  if (!env.GEMINI_GOOGLE_SEARCH_GROUNDING) return false;
+  const allowed = env.GEMINI_GOOGLE_SEARCH_OPERATIONS.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return allowed.includes(operation);
+}
+
 function buildGeminiBody(
   systemPrompt: string,
   contents: Content[],
-  generationConfig: Record<string, unknown>
+  generationConfig: Record<string, unknown>,
+  operation: ChatModelOperation
 ): GeminiGenerateBody {
-  return {
+  const body: GeminiGenerateBody = {
     systemInstruction: { parts: [{ text: systemPrompt }] },
     contents,
     generationConfig,
     safetySettings: SAFETY_SETTINGS,
   };
+  if (googleSearchGroundingEnabled(operation)) {
+    body.tools = [...GOOGLE_SEARCH_TOOLS];
+  }
+  return body;
 }
 
 const NO_THINKING = { thinkingConfig: { thinkingBudget: 0 } };
@@ -296,139 +319,6 @@ function extractJsonObject(raw: string): Record<string, unknown> {
   return JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
 }
 
-export interface ChatMessage {
-  role: "user" | "model";
-  text: string;
-}
-
-export interface GenerateAgentResponseInput {
-  systemPrompt: string;
-  conversationHistory: ChatMessage[];
-  extraInstructions?: string;
-}
-
-const CHAT_HISTORY_CAP = 24;
-const CHAT_RETRY_HISTORY_CAP = 8;
-
-function buildChatContents(history: ChatMessage[], prompt: string): Content[] {
-  return [
-    ...history.map((m) => ({
-      role: m.role,
-      parts: [{ text: m.text }],
-    })),
-    { role: "user", parts: [{ text: prompt }] },
-  ];
-}
-
-function trimConversationLines(lines: string, maxLines: number): string {
-  const parts = lines.split("\n").filter((line) => line.trim());
-  if (parts.length <= maxLines) return lines;
-  return parts.slice(-maxLines).join("\n");
-}
-
-async function requestChatResponse(
-  modelName: string,
-  systemPrompt: string,
-  history: ChatMessage[],
-  prompt: string,
-  thinking: Record<string, unknown>,
-  startedAt: number
-): Promise<{
-  text: string;
-  finishReason: string;
-  body: GeminiGenerateBody;
-  data: Record<string, unknown>;
-  http: ChatModelHttpCapture;
-}> {
-  const body = buildGeminiBody(
-    systemPrompt,
-    buildChatContents(history, prompt),
-    baseGenerationConfig({
-      temperature: CHAT_TUNING.temperature,
-      maxOutputTokens: CHAT_TUNING.maxTokens,
-      ...thinking,
-    })
-  );
-  const { data, http } = await geminiPost(modelName, body, "chat", startedAt);
-  return {
-    text: extractTextFromResponse(data),
-    finishReason: getFinishReason(data),
-    body,
-    data,
-    http,
-  };
-}
-
-/**
- * Generate agent response text using Gemini Flash.
- */
-export async function generateAgentResponse(
-  input: GenerateAgentResponseInput
-): Promise<string> {
-  const modelName = getChatModel();
-  const prompt = input.extraInstructions
-    ? input.extraInstructions
-    : "Respond naturally to the conversation. Keep it brief for voice.";
-  const systemPrompt = `${input.systemPrompt}\n\n${CHAT_TUNING.systemPromptAppend}`;
-
-  const cappedHistory = input.conversationHistory.slice(-CHAT_HISTORY_CAP);
-  const reqStarted = logApiRequest(
-    "GEMINI",
-    "chat",
-    `model=${modelName}, history=${cappedHistory.length}, prompt="${previewText(prompt, 60)}"`
-  );
-
-  try {
-    let attempt = await requestChatResponse(
-      modelName,
-      systemPrompt,
-      cappedHistory,
-      prompt,
-      NO_THINKING,
-      reqStarted
-    );
-    let { text, finishReason } = attempt;
-
-    if (!text && cappedHistory.length > CHAT_RETRY_HISTORY_CAP) {
-      const trimmedHistory = cappedHistory.slice(-CHAT_RETRY_HISTORY_CAP);
-      logger.warn(
-        "GEMINI",
-        `chat empty (finishReason=${finishReason}) — retrying with history ${cappedHistory.length}→${trimmedHistory.length}`
-      );
-      attempt = await requestChatResponse(
-        modelName,
-        systemPrompt,
-        trimmedHistory,
-        prompt,
-        NO_THINKING,
-        reqStarted
-      );
-      ({ text, finishReason } = attempt);
-    }
-
-    if (!text) {
-      logApiResponse("GEMINI", reqStarted, "chat", `empty (finishReason=${finishReason})`);
-      logGeminiLogicalError(
-        "chat",
-        modelName,
-        `Empty chat response (finishReason=${finishReason})`,
-        reqStarted,
-        attempt.http
-      );
-      throw new Error(`Empty chat response (finishReason=${finishReason})`);
-    }
-
-    logApiResponse("GEMINI", reqStarted, "chat", `"${previewText(text)}"`);
-    return text;
-  } catch (err) {
-    if (!(err instanceof Error && err.message.startsWith("Empty chat"))) {
-      logApiError("GEMINI", reqStarted, "chat", (err as Error).message);
-    }
-    if (err instanceof Error && err.message.startsWith("Empty chat")) throw err;
-    throw formatGeminiError(err, "chat", modelName);
-  }
-}
-
 export interface StructuredJsonInput {
   systemPrompt: string;
   userPrompt: string;
@@ -455,7 +345,8 @@ export async function generateStructuredJson<T>(
     baseGenerationConfig({
       maxOutputTokens: 4096,
       ...NO_THINKING,
-    })
+    }),
+    "structured_json"
   );
 
   try {
@@ -507,99 +398,30 @@ export async function generateStructuredJson<T>(
   }
 }
 
-/**
- * Simple one-shot Gemini text generation for routing etc.
- */
-export async function generateJsonReply(
-  system: string,
-  user: string,
-  modelOverride?: string,
-  signal?: AbortSignal
-): Promise<Record<string, unknown>> {
-  const modelName = getChatModel(modelOverride);
-  const reqStarted = logApiRequest(
-    "GEMINI",
-    "routing_json",
-    `model=${modelName}, user="${previewText(user, 60)}"`
-  );
-
-  const body = buildGeminiBody(
-    `${system}\n\n${JSON_SYSTEM_SUFFIX}`,
-    userOnlyContents(user),
-    baseGenerationConfig({
-      temperature: 0.15,
-      maxOutputTokens: 256,
-      ...NO_THINKING,
-    })
-  );
-
-  try {
-    const { data, http } = await geminiPost(modelName, body, "routing_json", reqStarted, signal);
-    const raw = extractTextFromResponse(data);
-    if (!raw) {
-      const finish = getFinishReason(data);
-      logApiResponse("GEMINI", reqStarted, "routing_json", `empty (finishReason=${finish})`);
-      logGeminiLogicalError(
-        "routing_json",
-        modelName,
-        `Empty JSON response (finishReason=${finish})`,
-        reqStarted,
-        http
-      );
-      throw new Error(`Empty JSON response (finishReason=${finish})`);
-    }
-    logApiResponse("GEMINI", reqStarted, "routing_json", `${raw.length} chars JSON`);
-    try {
-      return extractJsonObject(raw);
-    } catch (parseErr) {
-      logGeminiLogicalError(
-        "routing_json",
-        modelName,
-        (parseErr as Error).message,
-        reqStarted,
-        http
-      );
-      throw parseErr;
-    }
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw err;
-    }
-    if (!(err instanceof Error && err.message.startsWith("Empty JSON"))) {
-      if (
-        err instanceof Error &&
-        !err.message.startsWith("No JSON object") &&
-        !err.message.startsWith("Unclosed JSON")
-      ) {
-        logApiError("GEMINI", reqStarted, "routing_json", err.message);
-      }
-    }
-    if (err instanceof Error && err.message.startsWith("Empty JSON")) throw err;
-    if (
-      err instanceof Error &&
-      (err.message.startsWith("No JSON object") || err.message.startsWith("Unclosed JSON"))
-    ) {
-      throw err;
-    }
-    throw formatGeminiError(err, "routing_json", modelName);
-  }
-}
-
 export interface PickSpeakerAndRespondCandidate {
   id: string;
   name: string;
   systemPrompt: string;
+  roleSummary?: string;
+  peerProfile?: string;
 }
 
 export interface PickSpeakerAndRespondInput {
   humanName: string;
-  conversationLines: string;
+  chatTranscript: string;
   candidates: PickSpeakerAndRespondCandidate[];
-  context: "human_turn" | "chain";
-  scenarioHint: string;
+  meetingMetadata: LiveMeetingMetadata;
+  afterHuman: boolean;
+  handoffOnly?: boolean;
   lastSpeakerName?: string;
-  recentSpeakerNames?: string[];
+  lastTranscript?: string;
   signal?: AbortSignal;
+}
+
+function trimConversationLines(lines: string, maxLines: number): string {
+  const parts = lines.split("\n").filter((line) => line.trim());
+  if (parts.length <= maxLines) return lines;
+  return parts.slice(-maxLines).join("\n");
 }
 
 /**
@@ -628,7 +450,8 @@ async function requestMergedTurn(
       temperature: CHAT_TUNING.temperature,
       maxOutputTokens: Math.max(CHAT_TUNING.maxTokens, 1024),
       ...thinking,
-    })
+    }),
+    "merged_turn"
   );
   const { data, http } = await geminiPost(modelName, body, "merged_turn", startedAt, signal);
   return {
@@ -646,78 +469,35 @@ export async function pickSpeakerAndRespond(
   const modelName = getChatModel();
   const human = input.humanName.trim() || "You";
   const agentNames = input.candidates.map((c) => c.name).join(", ");
+  const chatTranscript = input.chatTranscript || "(session just started)";
 
-  const recentHint =
-    input.recentSpeakerNames && input.recentSpeakerNames.length > 0
-      ? `Recently spoke (most recent last): ${input.recentSpeakerNames.join(", ")}.`
-      : "";
+  const meetingMetadata = formatLiveMeetingMetadata({
+    ...input.meetingMetadata,
+    agents: input.candidates.map((c) => ({
+      name: c.name,
+      systemPrompt: c.systemPrompt,
+      roleSummary: c.roleSummary,
+      peerProfile: c.peerProfile,
+    })),
+  });
 
-  const contextHint =
-    input.context === "human_turn"
-      ? `${human} (the live human) JUST finished speaking on push-to-talk. An AGENT must reply next — not ${human}.`
-      : "An agent just finished speaking. Pick who should speak next in the natural back-and-forth.";
-
-  const routingRules =
-    input.context === "human_turn"
-      ? [
-          `CRITICAL — human_turn (human just spoke):`,
-          `- "next" MUST be exactly one agent first name from: ${agentNames}.`,
-          `- NEVER set "next" to "${human}", "human", "You", or "random" on this turn.`,
-          `- ${human} is waiting for an advisor to answer — even if they asked the whole table a question, pick the best-fit agent.`,
-          `- If ${human} named an agent, pick that agent.`,
-          `- If the floor is open, pick a specific agent first name (prefer someone who has not spoken recently). Never output "random".`,
-          `- "response" MUST be that agent's spoken reply (non-empty, first person, under 60 words).`,
-        ].join("\n")
-      : [
-          `chain (agent-to-agent or handoff):`,
-          `- Pick who should SPEAK next — not who is being discussed.`,
-          `- Set "next" to "${human}" or "human" ONLY when the last speaker was an AGENT who asked ${human} a direct question that needs ${human}'s answer — leave "response" empty.`,
-          `- If the floor is open, pick a specific agent first name (prefer someone who has not spoken recently). Never output "random".`,
-          `- Otherwise "next" must be an agent first name and "response" must be their spoken line.`,
-        ].join("\n");
-
-  const personas = input.candidates
-    .map((c) => `### ${c.name}\n${c.systemPrompt}`)
-    .join("\n\n");
-
-  const system = `You are the turn-taking router and voice for a live voice conference.
-${contextHint}
-
-Agents (use exact first names in "next"): ${agentNames}
-Also present: ${human} (live human with push-to-talk — only speaks when they press the button).
-
-${routingRules}
-${recentHint ? `- Recently spoke (most recent last): ${recentHint.replace("Recently spoke (most recent last): ", "")}` : ""}
-- Never read instructions aloud. Never mention routing or meta-rules.
-
-Agent personas (when you pick an agent, speak AS them in "response"):
-${personas}
-
-Reply with JSON only: {"next":"<AgentFirstName|${human}|human>","reason":"<max 12 words>","response":"<spoken line or empty>"}`;
-
-  const userPrompt =
-    input.context === "human_turn"
-      ? [
-          `Conversation so far:\n${input.conversationLines || "(session just started)"}`,
-          input.lastSpeakerName ? `Last speaker: ${input.lastSpeakerName}` : `Last speaker: ${human}`,
-          input.scenarioHint,
-          `\n${human} just spoke. Pick which AGENT replies next and write their line. "next" must be an agent name — not ${human}.`,
-        ]
-      : [
-          `Conversation so far:\n${input.conversationLines || "(session just started)"}`,
-          input.lastSpeakerName ? `Last speaker: ${input.lastSpeakerName}` : "",
-          input.scenarioHint,
-          "\nWho should speak next, and what do they say?",
-        ];
-
-  const conversationLines = input.conversationLines || "(session just started)";
-  const user = userPrompt.filter(Boolean).join("\n");
-  const systemWithTuning = `${system}\n\n${CHAT_TUNING.systemPromptAppend}`;
+  const liveTurn = buildLiveTurnPrompt({
+    humanName: human,
+    agentNames,
+    afterHuman: input.afterHuman,
+    handoffOnly: input.handoffOnly,
+    meetingMetadata,
+    chatTranscript,
+    lastSpeakerName: input.lastSpeakerName,
+    lastTranscript: input.lastTranscript,
+  });
+  const systemWithTuning = appendChatVoiceRules(liveTurn.system);
+  const user = liveTurn.user;
 
   const reqStarted = logApiRequest(
     "GEMINI",
     "merged_turn",
-    `model=${modelName}, context=${input.context}, agents=${input.candidates.length}`
+    `model=${modelName}, afterHuman=${input.afterHuman}, handoffOnly=${Boolean(input.handoffOnly)}, agents=${input.candidates.length}`
   );
 
   try {
@@ -731,13 +511,13 @@ Reply with JSON only: {"next":"<AgentFirstName|${human}|human>","reason":"<max 1
     );
     let { raw, finishReason } = attempt;
 
-    const lineCount = conversationLines.split("\n").filter((l) => l.trim()).length;
+    const lineCount = chatTranscript.split("\n").filter((l) => l.trim()).length;
     if (!raw && lineCount > MERGED_TURN_RETRY_LINES_CAP) {
-      const trimmedLines = trimConversationLines(conversationLines, MERGED_TURN_RETRY_LINES_CAP);
-      const retryUser = user.replace(conversationLines, trimmedLines);
+      const trimmedTranscript = trimConversationLines(chatTranscript, MERGED_TURN_RETRY_LINES_CAP);
+      const retryUser = user.replace(chatTranscript, trimmedTranscript);
       logger.warn(
         "GEMINI",
-        `merged_turn empty (finishReason=${finishReason}) — retrying with conversation ${lineCount}→${MERGED_TURN_RETRY_LINES_CAP} lines, NO_THINKING`
+        `merged_turn empty (finishReason=${finishReason}) — retrying with conversation ${lineCount}→${MERGED_TURN_RETRY_LINES_CAP} lines`
       );
       attempt = await requestMergedTurn(
         modelName,
@@ -774,15 +554,21 @@ Reply with JSON only: {"next":"<AgentFirstName|${human}|human>","reason":"<max 1
       );
       throw parseErr;
     }
-    const next = typeof parsed.next === "string" ? parsed.next : "?";
-    const responsePreview =
-      typeof parsed.response === "string" ? previewText(parsed.response, 50) : "(no response)";
-    logApiResponse(
-      "GEMINI",
-      reqStarted,
-      "merged_turn",
-      `next=${next}, response="${responsePreview}"`
-    );
+    if (input.handoffOnly) {
+      const handoffPreview =
+        typeof parsed.handoff === "string" ? previewText(parsed.handoff, 50) : "(no handoff)";
+      logApiResponse("GEMINI", reqStarted, "merged_turn", `handoff="${handoffPreview}"`);
+    } else {
+      const next = typeof parsed.next === "string" ? parsed.next : "?";
+      const responsePreview =
+        typeof parsed.response === "string" ? previewText(parsed.response, 50) : "(no response)";
+      logApiResponse(
+        "GEMINI",
+        reqStarted,
+        "merged_turn",
+        `next=${next}, response="${responsePreview}"`
+      );
+    }
     return parsed;
   } catch (err) {
     if (!(err instanceof Error && err.message.startsWith("Empty merged"))) {

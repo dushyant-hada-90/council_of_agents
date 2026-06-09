@@ -1,14 +1,17 @@
 import { EventEmitter } from "events";
 import type { AgentConfig } from "../lib/agents/types";
-import { buildMeetingRoster } from "../lib/agents/roster";
 import { splitIntoSpeechChunks } from "../lib/helpers/text/sentenceSplit";
-import { generateAgentResponse, type ChatMessage } from "../lib/pipeline/geminiChat";
 import { synthesizeSpeech, pcmToBase64Chunks } from "../lib/pipeline/tts";
 import { logger } from "../lib/logger";
 import { PCM16_BYTES_PER_MS, type SessionState, type AgentSession, type PipelineHooks } from "./agentSession";
 
+interface ChatMessage {
+  role: "user" | "model";
+  text: string;
+}
+
 /**
- * Pipeline agent session: Gemini Flash (text) → Google TTS (audio).
+ * Pipeline agent session: TTS only — spoken text comes from merged-turn routing (pre-generated).
  */
 export class PipelineAgentSession extends EventEmitter implements AgentSession {
   public readonly agentId: string;
@@ -80,11 +83,16 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
     return false;
   }
 
-  triggerResponse(
-    extraInstructions?: string,
-    options?: { preGeneratedText?: string; hooks?: PipelineHooks }
-  ): void {
+  triggerResponse(options: { preGeneratedText: string; hooks?: PipelineHooks }): void {
     if (this.isDestroyed || this.state === "SPEAKING") return;
+
+    const text = options.preGeneratedText.trim();
+    if (!text) {
+      logger.error("PIPELINE", `${this.agentId} triggerResponse missing preGeneratedText`);
+      this.emit("responseDone", "failed", this.agentId);
+      return;
+    }
+
     this.abortController?.abort();
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
@@ -93,39 +101,15 @@ export class PipelineAgentSession extends EventEmitter implements AgentSession {
     this.currentTranscriptText = "";
     this.currentResponseAudioBytes = 0;
 
-    void this.runPipeline(extraInstructions, signal, options?.preGeneratedText, options?.hooks);
+    void this.runPipeline(text, signal, options.hooks);
   }
 
   private async runPipeline(
-    extraInstructions: string | undefined,
+    text: string,
     signal: AbortSignal,
-    preGeneratedText?: string,
     hooks?: PipelineHooks
   ): Promise<void> {
-    const roster = buildMeetingRoster(this.humanName, this.allAgents);
-    const systemPrompt = `${this.config.systemPrompt}\n\n${roster}`;
-
     try {
-      let text: string;
-      if (preGeneratedText) {
-        text = preGeneratedText.trim();
-        // Pre-generated: no Gemini call, text is already available
-      } else {
-        hooks?.onGeminiStart();
-        text = await generateAgentResponse({
-          systemPrompt,
-          conversationHistory: this.conversationHistory,
-          extraInstructions,
-        });
-        hooks?.onGeminiEnd(text);
-      }
-
-      if (signal.aborted || this.isDestroyed) {
-        hooks?.onDone("cancelled");
-        this.state = "READY";
-        return;
-      }
-
       this.currentTranscriptText = text;
       this.lastCompletedTranscript = text;
       this.emit("transcriptDelta", text, this.agentId);

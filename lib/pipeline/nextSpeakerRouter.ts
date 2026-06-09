@@ -1,6 +1,6 @@
 import { agentNamesMatch, findAgentByNameToken, normalizeAgentNameToken } from "@/lib/helpers/nameMatching";
+import { type LiveMeetingMetadata } from "@/lib/prompts/prompts";
 import {
-  generateJsonReply,
   pickSpeakerAndRespond,
   type PickSpeakerAndRespondCandidate,
 } from "./geminiChat";
@@ -24,31 +24,18 @@ export type MergedSpeakerPick =
       response: string;
     }
   | { source: "gemini"; kind: "human"; reason?: string }
+  | { source: "gemini"; kind: "pause"; reason?: string; handoff: string }
   | { source: "failed"; kind: "invalid"; reason?: string };
 
 export interface PickSpeakerAndRespondInput {
   humanName: string;
   turns: ConversationTurn[];
   candidates: PickSpeakerAndRespondCandidate[];
+  meetingMetadata: LiveMeetingMetadata;
+  afterHuman: boolean;
+  handoffOnly?: boolean;
   lastSpeakerId?: string;
-  recentSpeakerIds?: string[];
-  context: "human_turn" | "chain";
-  scenarioHint: string;
-  timeoutMs?: number;
-}
-
-export type ChainContinueDecision =
-  | { source: "gemini"; continue: boolean; reason?: string }
-  | { source: "fallback"; continue: boolean };
-
-export interface ShouldContinueChainInput {
-  humanName: string;
-  turns: ConversationTurn[];
-  chainTurnCount: number;
-  lastSpeakerName: string;
-  lastTranscript: string;
-  addresseeKind: "human" | "everyone" | "agent";
-  addresseeName?: string;
+  lastTranscript?: string;
   timeoutMs?: number;
 }
 
@@ -72,14 +59,14 @@ function isHumanSpeakerPick(next: string, humanName: string): boolean {
 async function withTimeout<T>(
   factory: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
-  fallback: T
+  onTimeout: T
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await factory(controller.signal);
   } catch (err) {
-    if (controller.signal.aborted) return fallback;
+    if (controller.signal.aborted) return onTimeout;
     throw err;
   } finally {
     clearTimeout(timer);
@@ -121,10 +108,19 @@ function resolveSpeakerName(
   return { kind: "invalid", raw: next };
 }
 
+function parseHandoffResult(parsed: Record<string, unknown>): MergedSpeakerPick {
+  const handoff = String(parsed.handoff ?? "").trim();
+  if (!handoff) {
+    return { source: "failed", kind: "invalid", reason: "empty handoff" };
+  }
+  logger.info("GEMINI", `Handoff line: "${handoff.slice(0, 60)}${handoff.length > 60 ? "…" : ""}"`);
+  return { source: "gemini", kind: "pause", handoff };
+}
+
 function parseMergedTurnResult(
   parsed: Record<string, unknown>,
   human: string,
-  context: PickSpeakerAndRespondInput["context"],
+  afterHuman: boolean,
   candidates: PickSpeakerAndRespondCandidate[]
 ): MergedSpeakerPick {
   const next = String(parsed.next ?? "").trim();
@@ -147,12 +143,12 @@ function parseMergedTurnResult(
   }
 
   if (resolved.kind === "human") {
-    if (context === "human_turn") {
+    if (afterHuman) {
       logger.warn(
         "GEMINI",
-        `Merged turn rejected human handoff on human_turn (next="${next}"${reason ? `, reason="${reason}"` : ""})`
+        `Merged turn rejected human handoff after human spoke (next="${next}"${reason ? `, reason="${reason}"` : ""})`
       );
-      return { source: "failed", kind: "invalid", reason: "human handoff on human_turn" };
+      return { source: "failed", kind: "invalid", reason: "human handoff after human spoke" };
     }
     logger.info("GEMINI", `Merged turn → ${human} (${reason ?? ""})`);
     return { source: "gemini", kind: "human", reason };
@@ -177,26 +173,41 @@ function parseMergedTurnResult(
   };
 }
 
+function parseChainTurnResult(
+  parsed: Record<string, unknown>,
+  human: string,
+  candidates: PickSpeakerAndRespondCandidate[]
+): MergedSpeakerPick {
+  if ("handoff" in parsed) {
+    return parseHandoffResult(parsed);
+  }
+  if ("next" in parsed) {
+    return parseMergedTurnResult(parsed, human, false, candidates);
+  }
+  return { source: "failed", kind: "invalid", reason: "missing next or handoff" };
+}
+
 async function attemptMergedTurn(
   input: PickSpeakerAndRespondInput,
   attempt: number
 ): Promise<MergedSpeakerPick> {
-  const { humanName, turns, candidates, lastSpeakerId, recentSpeakerIds, context, scenarioHint } =
-    input;
+  const {
+    humanName,
+    turns,
+    candidates,
+    meetingMetadata,
+    afterHuman,
+    handoffOnly,
+    lastSpeakerId,
+    lastTranscript,
+  } = input;
   const timeoutMs = input.timeoutMs ?? getEnv().GEMINI_MERGED_TURN_TIMEOUT_MS;
   const human = humanName.trim() || "You";
 
   const lastSpeakerName = lastSpeakerId
     ? candidates.find((c) => c.id === lastSpeakerId)?.name
     : undefined;
-  const recentSpeakerNames =
-    recentSpeakerIds
-      ?.map((id) => candidates.find((c) => c.id === id)?.name)
-      .filter((n): n is string => Boolean(n)) ?? [];
-  const conversationLines = turns
-    .slice(-14)
-    .map((t) => `${t.speaker}: ${t.text}`)
-    .join("\n");
+  const chatTranscript = turns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
 
   if (attempt > 1) {
     logger.info("GEMINI", `Merged turn retry attempt ${attempt}/${MERGED_TURN_MAX_ATTEMPTS}`);
@@ -206,23 +217,38 @@ async function attemptMergedTurn(
     (signal) =>
       pickSpeakerAndRespond({
         humanName: human,
-        conversationLines,
+        chatTranscript,
         candidates,
-        context,
-        scenarioHint,
+        meetingMetadata,
+        afterHuman,
+        handoffOnly,
         lastSpeakerName,
-        recentSpeakerNames,
+        lastTranscript,
         signal,
       }),
     timeoutMs,
     {}
   );
 
-  if (!parsed || typeof parsed !== "object" || !("next" in parsed)) {
+  if (!parsed || typeof parsed !== "object") {
     return { source: "failed", kind: "invalid", reason: "timeout or empty payload" };
   }
 
-  return parseMergedTurnResult(parsed as Record<string, unknown>, human, context, candidates);
+  if (handoffOnly) {
+    if (!("handoff" in parsed)) {
+      return { source: "failed", kind: "invalid", reason: "timeout or empty handoff payload" };
+    }
+    return parseHandoffResult(parsed as Record<string, unknown>);
+  }
+
+  if (afterHuman) {
+    if (!("next" in parsed)) {
+      return { source: "failed", kind: "invalid", reason: "timeout or empty payload" };
+    }
+    return parseMergedTurnResult(parsed as Record<string, unknown>, human, true, candidates);
+  }
+
+  return parseChainTurnResult(parsed as Record<string, unknown>, human, candidates);
 }
 
 export async function pickSpeakerAndRespondWithGemini(
@@ -254,63 +280,24 @@ export async function pickSpeakerAndRespondWithGemini(
   return lastFailure;
 }
 
-export async function shouldContinueChainWithGemini(
-  input: ShouldContinueChainInput
-): Promise<ChainContinueDecision> {
-  const {
-    humanName,
-    turns,
-    chainTurnCount,
-    lastSpeakerName,
-    lastTranscript,
-    addresseeKind,
-    addresseeName,
-  } = input;
-  const human = humanName.trim() || "You";
-  const timeoutMs = input.timeoutMs ?? getEnv().GEMINI_ROUTING_TIMEOUT_MS;
-
-  const recent = turns
-    .slice(-12)
-    .map((t) => `${t.speaker}: ${t.text}`)
-    .join("\n");
-
-  const addresseeHint =
-    addresseeKind === "agent" && addresseeName
-      ? `${lastSpeakerName} directly addressed ${addresseeName} — the chain likely continues.`
-      : addresseeKind === "everyone"
-        ? `${lastSpeakerName} spoke to the open table.`
-        : `${lastSpeakerName} asked ${human} a question.`;
-
-  const system = `You decide whether a live voice conference should allow another agent-to-agent reaction turn.
-
-${addresseeHint}
-Agent-to-agent turns so far since the human last spoke: ${chainTurnCount}.
-
-Continue the chain when there is unresolved disagreement or an open challenge.
-Stop when the point feels settled or it is time to invite ${human} back.
-
-Reply with JSON only: {"continue":true|false,"reason":"<max 12 words>"}`;
-
-  const user = `Recent conversation:\n${recent || "(empty)"}\n\nLast line from ${lastSpeakerName}: "${lastTranscript}"\n\nShould another agent react?`;
-
-  const fallback: ChainContinueDecision = {
-    source: "fallback",
-    continue: Math.random() < 0.8,
-  };
-
-  try {
-    const parsed = await withTimeout(
-      (signal) => generateJsonReply(system, user, undefined, signal),
-      timeoutMs,
-      {}
-    );
-
-    const shouldContinue = parsed.continue === true;
-    const reason = parsed.reason ? String(parsed.reason) : undefined;
-    logger.info("GEMINI", `Chain → ${shouldContinue ? "continue" : "pause"} (${reason ?? ""})`);
-    return { source: "gemini", continue: shouldContinue, reason };
-  } catch (err) {
-    logger.warn("GEMINI", `Chain decision failed: ${(err as Error).message}`);
-    return fallback;
-  }
+export async function requestHandoffWithGemini(input: {
+  humanName: string;
+  turns: ConversationTurn[];
+  candidates: PickSpeakerAndRespondCandidate[];
+  meetingMetadata: LiveMeetingMetadata;
+  lastSpeakerId: string;
+  lastTranscript?: string;
+  timeoutMs?: number;
+}): Promise<MergedSpeakerPick> {
+  return pickSpeakerAndRespondWithGemini({
+    humanName: input.humanName,
+    turns: input.turns,
+    candidates: input.candidates,
+    meetingMetadata: input.meetingMetadata,
+    afterHuman: false,
+    handoffOnly: true,
+    lastSpeakerId: input.lastSpeakerId,
+    lastTranscript: input.lastTranscript,
+    timeoutMs: input.timeoutMs,
+  });
 }

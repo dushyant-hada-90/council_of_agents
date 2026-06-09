@@ -10,12 +10,14 @@ const envSchema = z.object({
     .min(1, "GOOGLE_APPLICATION_CREDENTIALS is required (path to GCP service account JSON)"),
   GEMINI_PLANNER_MODEL: z.string().default("gemini-3.5-flash"),
   GEMINI_CHAT_MODEL: z.string().default("gemini-3.5-flash"),
-  GEMINI_STT_CLEANUP: z
+  GEMINI_MERGED_TURN_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
+  /** When true, attach googleSearch tool to selected Gemini operations (see GEMINI_GOOGLE_SEARCH_OPERATIONS). */
+  GEMINI_GOOGLE_SEARCH_GROUNDING: z
     .enum(["true", "false", "1", "0"])
     .default("false")
     .transform((v) => v === "true" || v === "1"),
-  GEMINI_ROUTING_TIMEOUT_MS: z.coerce.number().int().positive().default(3000),
-  GEMINI_MERGED_TURN_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
+  /** Comma-separated Gemini ops that receive Google Search grounding: structured_json, merged_turn */
+  GEMINI_GOOGLE_SEARCH_OPERATIONS: z.string().default("structured_json"),
   AWS_REGION: z.string().min(1, "AWS_REGION is required"),
   AWS_ACCESS_KEY_ID: z.string().min(1, "AWS_ACCESS_KEY_ID is required"),
   AWS_SECRET_ACCESS_KEY: z.string().min(1, "AWS_SECRET_ACCESS_KEY is required"),

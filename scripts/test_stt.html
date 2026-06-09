@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Google STT harness — council_of_agents pipeline</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3b82f6;
+      --accent-dim: #2563eb;
+      --danger: #ef4444;
+      --success: #22c55e;
+      --mono: ui-monospace, "Cascadia Code", "Segoe UI Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 1.25rem;
+    }
+    h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+    .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.25rem; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+    }
+    .card h2 {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 0 0 0.75rem;
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.25rem;
+    }
+    input, select, textarea {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 0.45rem 0.6rem;
+      font-size: 0.9rem;
+      margin-bottom: 0.65rem;
+    }
+    textarea { font-family: var(--mono); font-size: 0.75rem; min-height: 72px; resize: vertical; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+    button {
+      border: none;
+      border-radius: 8px;
+      padding: 0.65rem 1.1rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.05s;
+    }
+    button:active { transform: scale(0.98); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #btnEnableMic {
+      background: #059669;
+      color: #fff;
+    }
+    #btnEnableMic:not(:disabled):hover { background: #047857; }
+    #btnPtt {
+      background: var(--accent);
+      color: #fff;
+      min-width: 160px;
+    }
+    #btnPtt.active { background: var(--danger); }
+    #btnDownload, #btnTranscribe {
+      background: #334155;
+      color: var(--text);
+    }
+    #btnDownload:not(:disabled):hover, #btnTranscribe:not(:disabled):hover { background: #475569; }
+    .transcript {
+      font-size: 1.35rem;
+      font-weight: 500;
+      min-height: 3rem;
+      padding: 0.75rem;
+      background: #0d1117;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .transcript.empty { color: var(--muted); font-size: 1rem; font-weight: 400; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 0.5rem;
+    }
+    .stat {
+      background: #0d1117;
+      border-radius: 6px;
+      padding: 0.5rem 0.65rem;
+      border: 1px solid var(--border);
+    }
+    .stat .k { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }
+    .stat .v { font-family: var(--mono); font-size: 0.95rem; }
+    pre.json {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+      overflow: auto;
+      max-height: 420px;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+    }
+    .hint { font-size: 0.78rem; color: var(--muted); margin-top: 0.35rem; }
+    .status { font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem; }
+    .status.err { color: #f87171; }
+    .status.ok { color: var(--success); }
+    .checks label { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.4rem; color: var(--text); font-size: 0.85rem; }
+    .checks input { width: auto; margin: 0; }
+  </style>
+</head>
+<body>
+  <h1>Google STT test harness</h1>
+  <p class="subtitle">
+    Mirrors <code>lib/pipeline/stt.ts</code> + <code>HumanSegmentTranscriber</code> + MeetingRoom mic capture.
+    Auth: GOOGLE_APPLICATION_CREDENTIALS JSON → OAuth token (service account JWT or authorized_user refresh), same as <code>@google-cloud/speech</code>.
+  </p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Auth (GOOGLE_APPLICATION_CREDENTIALS)</h2>
+      <label for="saFile">Load credentials JSON file</label>
+      <input type="file" id="saFile" accept=".json,application/json" />
+      <label for="saJson">Or paste JSON</label>
+      <textarea id="saJson" placeholder='service_account: {"type":"service_account","client_email":"...","private_key":"..."}&#10;authorized_user: {"type":"authorized_user","client_id":"...","client_secret":"...","refresh_token":"..."}'></textarea>
+      <p class="hint">
+        Accepts the same JSON as <code>GOOGLE_APPLICATION_CREDENTIALS</code> on the server:
+        <strong>service_account</strong> (JWT) or <strong>authorized_user</strong> (refresh token).
+        For <code>authorized_user</code>, include <code>quota_project_id</code> — the client library sends it as <code>x-goog-user-project</code> automatically; this harness does the same.
+      </p>
+      <p class="status" id="authStatus">No credentials loaded.</p>
+    </div>
+
+    <div class="card">
+      <h2>RecognitionConfig (A/B)</h2>
+      <label for="sampleRate">sampleRateHertz (STT + resample target)</label>
+      <select id="sampleRate">
+        <option value="24000" selected>24000 — backend default (CAPTURE_SAMPLE_RATE)</option>
+        <option value="16000">16000</option>
+        <option value="48000">48000</option>
+      </select>
+      <label for="languageCode">languageCode</label>
+      <select id="languageCode">
+        <option value="en-IN" selected>en-IN — backend default</option>
+        <option value="en-US">en-US</option>
+        <option value="en-GB">en-GB</option>
+        <option value="hi-IN">hi-IN</option>
+      </select>
+      <label for="altLangs">alternativeLanguageCodes (comma-separated)</label>
+      <input id="altLangs" value="en-US,en-GB" />
+      <label for="model">model</label>
+      <select id="model">
+        <option value="latest_long" selected>latest_long — backend default</option>
+        <option value="latest_short">latest_short</option>
+        <option value="default">default</option>
+      </select>
+      <div class="checks">
+        <label><input type="checkbox" id="useEnhanced" checked /> useEnhanced (backend: true)</label>
+        <label><input type="checkbox" id="autoPunct" checked /> enableAutomaticPunctuation</label>
+        <label><input type="checkbox" id="wordOffsets" checked /> enableWordTimeOffsets (harness extra — inspect JSON)</label>
+        <label><input type="checkbox" id="wordConfidence" checked /> enableWordConfidence</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Segment transcriber (rolling STT)</h2>
+      <label for="segmentSec">HUMAN_STT_SEGMENT_SEC</label>
+      <input type="number" id="segmentSec" value="30" min="1" max="120" />
+      <label for="overlapSec">HUMAN_STT_OVERLAP_SEC</label>
+      <input type="number" id="overlapSec" value="5" min="0" max="29" />
+      <p class="hint">ScriptProcessor bufferSize=4096, mono, echo/noise/AGC — same as MeetingRoom.</p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 1rem;">
+    <h2>Push to talk</h2>
+    <div class="row">
+      <button type="button" id="btnEnableMic">Enable microphone</button>
+      <button type="button" id="btnPtt" disabled>Hold to speak (Space)</button>
+      <button type="button" id="btnDownload" disabled>Download WAV</button>
+      <button type="button" id="btnTranscribe" disabled>Transcribe again</button>
+    </div>
+    <p class="status" id="pttStatus">Click “Enable microphone” first (browser requires a user gesture for Web Audio).</p>
+  </div>
+
+  <div class="card" style="margin-bottom: 1rem;">
+    <h2>Transcript</h2>
+    <div class="transcript empty" id="transcript">Hold PTT, release, then STT runs (segmented like the server).</div>
+  </div>
+
+  <div class="card" style="margin-bottom: 1rem;">
+    <h2>Stats</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">audioBytes</div><div class="v" id="statBytes">—</div></div>
+      <div class="stat"><div class="k">audioChunks</div><div class="v" id="statChunks">—</div></div>
+      <div class="stat"><div class="k">pttDurationMs</div><div class="v" id="statPttMs">—</div></div>
+      <div class="stat"><div class="k">audioDurationMs</div><div class="v" id="statAudioMs">—</div></div>
+      <div class="stat"><div class="k">sttDurationMs</div><div class="v" id="statSttMs">—</div></div>
+      <div class="stat"><div class="k">segments</div><div class="v" id="statSegments">—</div></div>
+      <div class="stat"><div class="k">rms dBFS</div><div class="v" id="statRms">—</div></div>
+      <div class="stat"><div class="k">capture Hz</div><div class="v" id="statCaptureHz">—</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Raw Google STT JSON</h2>
+    <pre class="json" id="rawJson">{}</pre>
+  </div>
+
+  <script>
+    // ─── Backend defaults (lib/pipeline/stt.ts, lib/helpers/audio/pcm.ts) ───
+    const DEFAULT_CAPTURE_RATE = 24000;
+    const PCM16_BYTES_PER_MS = (rate) => (rate * 2) / 1000;
+    const MIN_PCM_SEC = 0.1;
+    const SILENT_DBFS = -55;
+    const PROCESSOR_BUFFER = 4096;
+
+    // ─── State ───
+    /** @type {Record<string, unknown> | null} */
+    let gcpCredentials = null;
+    /** @type {"service_account" | "authorized_user" | null} */
+    let credentialsType = null;
+    let accessToken = null;
+    let tokenExpiry = 0;
+    /** Billing/quota project for authorized_user ADC (google-auth-library sets x-goog-user-project) */
+    let quotaProjectId = null;
+
+    let audioCtx = null;
+    let captureSampleRate = DEFAULT_CAPTURE_RATE;
+    let micStream = null;
+    let processor = null;
+    let micReady = false;
+    /** @type {Promise<void> | null} */
+    let micInitPromise = null;
+    let isPtt = false;
+    let pttStartedAt = 0;
+
+    /** @type {Uint8Array[]} WS-style PCM chunks (Int16 LE bytes each) */
+    let pcmChunks = [];
+    let audioBytes = 0;
+    let audioChunkCount = 0;
+    let lastPcm = null;
+    let lastSampleRate = DEFAULT_CAPTURE_RATE;
+
+    /** Segment transcriber (mirrors HumanSegmentTranscriber) */
+    let segBuffer = new Uint8Array(0);
+    /** @type {{ index: number, promise: Promise<{ text: string, json: object, ms: number } | null> }[]} */
+    let segmentJobs = [];
+    let segmentCount = 0;
+
+    // ─── PCM helpers (lib/meeting/audioCapture.ts) ───
+    function downsampleFloat32(input, fromRate, toRate) {
+      if (fromRate === toRate) return input;
+      if (fromRate < toRate || fromRate <= 0 || toRate <= 0) return input;
+      const ratio = fromRate / toRate;
+      const outLength = Math.floor(input.length / ratio);
+      if (outLength <= 0) return new Float32Array(0);
+      const output = new Float32Array(outLength);
+      for (let i = 0; i < outLength; i++) {
+        const pos = i * ratio;
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        const s0 = input[idx] ?? 0;
+        const s1 = input[Math.min(idx + 1, input.length - 1)] ?? s0;
+        output[i] = s0 + frac * (s1 - s0);
+      }
+      return output;
+    }
+
+    function float32ToPcm16(input) {
+      const pcm16 = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        pcm16[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+      }
+      return pcm16;
+    }
+
+    function concatUint8(arrays) {
+      const total = arrays.reduce((s, a) => s + a.byteLength, 0);
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const a of arrays) {
+        out.set(a, off);
+        off += a.byteLength;
+      }
+      return out;
+    }
+
+    function pcm16DurationMs(byteLength, sampleRate) {
+      return Math.round(byteLength / PCM16_BYTES_PER_MS(sampleRate));
+    }
+
+    function computeRmsDb(pcmBytes) {
+      const samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
+      let sumSq = 0;
+      const step = Math.max(1, Math.floor(samples.length / 2000));
+      let count = 0;
+      for (let i = 0; i < samples.length; i += step) {
+        const s = samples[i] / 32768;
+        sumSq += s * s;
+        count++;
+      }
+      const rms = Math.sqrt(sumSq / Math.max(1, count));
+      return Math.round(20 * Math.log10(rms + 1e-9));
+    }
+
+    function segmentBytes(sampleRate) {
+      const sec = Number(document.getElementById("segmentSec").value) || 30;
+      return Math.round(sec * sampleRate * 2);
+    }
+
+    function overlapBytes(sampleRate) {
+      const sec = Number(document.getElementById("overlapSec").value) || 5;
+      return Math.round(sec * sampleRate * 2);
+    }
+
+    function strideBytes(sampleRate) {
+      return segmentBytes(sampleRate) - overlapBytes(sampleRate);
+    }
+
+    // ─── Transcript merge (lib/helpers/audio/transcriptMerge.ts) ───
+    function mergeSegmentTranscripts(parts, maxOverlapWords = 15) {
+      const normalize = (t) => t.replace(/\s+/g, " ").trim().split(/\s+/).filter(Boolean);
+      const segments = parts.map(normalize).filter((w) => w.length);
+      if (!segments.length) return "";
+      if (segments.length === 1) return segments[0].join(" ");
+      let merged = [...segments[0]];
+      for (let i = 1; i < segments.length; i++) {
+        const next = segments[i];
+        let overlap = 0;
+        const max = Math.min(merged.length, next.length, maxOverlapWords);
+        for (let len = max; len > 0; len--) {
+          let ok = true;
+          for (let j = 0; j < len; j++) {
+            if (merged[merged.length - len + j].toLowerCase() !== next[j].toLowerCase()) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) { overlap = len; break; }
+        }
+        merged.push(...next.slice(overlap));
+        const deduped = [];
+        for (const w of merged) {
+          const prev = deduped[deduped.length - 1];
+          if (prev && prev.toLowerCase() === w.toLowerCase()) continue;
+          deduped.push(w);
+        }
+        merged = deduped;
+      }
+      return merged.join(" ");
+    }
+
+    function extractTranscript(results) {
+      return (results || [])
+        .map((r) => r.alternatives?.[0]?.transcript ?? "")
+        .join(" ")
+        .trim();
+    }
+
+    // ─── WAV export ───
+    function pcmToWav(pcmBytes, sampleRate) {
+      const dataLen = pcmBytes.byteLength;
+      const buf = new ArrayBuffer(44 + dataLen);
+      const v = new DataView(buf);
+      const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+      writeStr(0, "RIFF");
+      v.setUint32(4, 36 + dataLen, true);
+      writeStr(8, "WAVE");
+      writeStr(12, "fmt ");
+      v.setUint32(16, 16, true);
+      v.setUint16(20, 1, true);
+      v.setUint16(22, 1, true);
+      v.setUint32(24, sampleRate, true);
+      v.setUint32(28, sampleRate * 2, true);
+      v.setUint16(32, 2, true);
+      v.setUint16(34, 16, true);
+      writeStr(36, "data");
+      v.setUint32(40, dataLen, true);
+      new Uint8Array(buf, 44).set(pcmBytes);
+      return new Blob([buf], { type: "audio/wav" });
+    }
+
+    // ─── Service account JWT auth (mirrors google-auth-library) ───
+    function pemToArrayBuffer(pem) {
+      const b64 = pem
+        .replace(/-----BEGIN PRIVATE KEY-----/, "")
+        .replace(/-----END PRIVATE KEY-----/, "")
+        .replace(/\s/g, "");
+      const raw = atob(b64);
+      const buf = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+      return buf.buffer;
+    }
+
+    function base64UrlEncode(bytes) {
+      let bin = "";
+      const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function base64UrlEncodeJson(obj) {
+      return base64UrlEncode(new TextEncoder().encode(JSON.stringify(obj)));
+    }
+
+    async function importPrivateKey(pem) {
+      return crypto.subtle.importKey(
+        "pkcs8",
+        pemToArrayBuffer(pem),
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+    }
+
+    async function signJwt(sa) {
+      const now = Math.floor(Date.now() / 1000);
+      const header = { alg: "RS256", typ: "JWT" };
+      const claim = {
+        iss: sa.client_email,
+        sub: sa.client_email,
+        aud: "https://oauth2.googleapis.com/token",
+        iat: now,
+        exp: now + 3600,
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+      };
+      const key = await importPrivateKey(sa.private_key);
+      const unsigned = `${base64UrlEncodeJson(header)}.${base64UrlEncodeJson(claim)}`;
+      const sig = await crypto.subtle.sign(
+        "RSASSA-PKCS1-v1_5",
+        key,
+        new TextEncoder().encode(unsigned)
+      );
+      return `${unsigned}.${base64UrlEncode(new Uint8Array(sig))}`;
+    }
+
+    async function refreshAccessToken(creds) {
+      const res = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: creds.client_id,
+          client_secret: creds.client_secret,
+          refresh_token: creds.refresh_token,
+          grant_type: "refresh_token",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error_description || data.error || "Refresh token exchange failed");
+      return data;
+    }
+
+    function apiHeaders(token) {
+      const headers = {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      };
+      // @google-cloud/speech injects this from credentials.quota_project_id for user ADC
+      if (quotaProjectId) {
+        headers["x-goog-user-project"] = quotaProjectId;
+      }
+      return headers;
+    }
+
+    function resolveQuotaProjectId(creds, type) {
+      if (creds.quota_project_id) return creds.quota_project_id;
+      if (type === "service_account" && creds.project_id) return creds.project_id;
+      return null;
+    }
+
+    async function getAccessToken() {
+      if (accessToken && Date.now() < tokenExpiry - 60_000) return accessToken;
+      if (!gcpCredentials || !credentialsType) throw new Error("Load credentials JSON first");
+
+      let data;
+      if (credentialsType === "service_account") {
+        const jwt = await signJwt(gcpCredentials);
+        const res = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion: jwt,
+          }),
+        });
+        data = await res.json();
+        if (!res.ok) throw new Error(data.error_description || data.error || "JWT token exchange failed");
+      } else {
+        data = await refreshAccessToken(gcpCredentials);
+      }
+
+      accessToken = data.access_token;
+      tokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+      const label =
+        credentialsType === "service_account"
+          ? gcpCredentials.client_email
+          : gcpCredentials.client_id;
+      document.getElementById("authStatus").textContent = `Authenticated (${credentialsType}) — ${label}`;
+      document.getElementById("authStatus").className = "status ok";
+      return accessToken;
+    }
+
+    function credentialsLabel(creds, type) {
+      if (type === "service_account") return creds.client_email;
+      return creds.client_id || "authorized_user";
+    }
+
+    function loadCredentials(jsonText) {
+      try {
+        const creds = JSON.parse(jsonText);
+        const type = creds.type;
+
+        if (type === "service_account") {
+          if (!creds.client_email || !creds.private_key) {
+            throw new Error("service_account requires client_email and private_key");
+          }
+        } else if (type === "authorized_user") {
+          if (!creds.client_id || !creds.client_secret || !creds.refresh_token) {
+            throw new Error("authorized_user requires client_id, client_secret, and refresh_token");
+          }
+        } else if (creds.client_email && creds.private_key) {
+          // Legacy service account JSON without explicit type field
+          creds.type = "service_account";
+        } else {
+          throw new Error(
+            'Unsupported credentials — expected type "service_account" or "authorized_user"'
+          );
+        }
+
+        const resolvedType = creds.type === "authorized_user" ? "authorized_user" : "service_account";
+        gcpCredentials = creds;
+        credentialsType = resolvedType;
+        quotaProjectId = resolveQuotaProjectId(creds, resolvedType);
+        accessToken = null;
+        let status = `Loaded ${resolvedType} — ${credentialsLabel(creds, resolvedType)} (token on first STT call)`;
+        if (resolvedType === "authorized_user") {
+          if (quotaProjectId) {
+            status += ` · quota project: ${quotaProjectId}`;
+          } else {
+            status += " · WARNING: missing quota_project_id (STT will fail — run gcloud auth application-default set-quota-project PROJECT)";
+          }
+        }
+        document.getElementById("authStatus").textContent = status;
+        document.getElementById("authStatus").className = quotaProjectId || resolvedType !== "authorized_user" ? "status ok" : "status err";
+      } catch (e) {
+        gcpCredentials = null;
+        credentialsType = null;
+        quotaProjectId = null;
+        document.getElementById("authStatus").textContent = `Invalid JSON: ${e.message}`;
+        document.getElementById("authStatus").className = "status err";
+      }
+    }
+
+    document.getElementById("saFile").addEventListener("change", (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        document.getElementById("saJson").value = reader.result;
+        loadCredentials(reader.result);
+      };
+      reader.readAsText(file);
+    });
+
+    document.getElementById("saJson").addEventListener("input", () => {
+      const t = document.getElementById("saJson").value.trim();
+      if (t) loadCredentials(t);
+    });
+
+    // ─── buildSttConfig (lib/pipeline/stt.ts) ───
+    function buildSttConfig(sampleRateHertz) {
+      const altRaw = document.getElementById("altLangs").value.trim();
+      const alternativeLanguageCodes = altRaw
+        ? altRaw.split(",").map((s) => s.trim()).filter(Boolean)
+        : [];
+      const cfg = {
+        encoding: "LINEAR16",
+        sampleRateHertz,
+        audioChannelCount: 1,
+        languageCode: document.getElementById("languageCode").value,
+        model: document.getElementById("model").value,
+        enableAutomaticPunctuation: document.getElementById("autoPunct").checked,
+        useEnhanced: document.getElementById("useEnhanced").checked,
+      };
+      if (alternativeLanguageCodes.length) {
+        cfg.alternativeLanguageCodes = alternativeLanguageCodes;
+      }
+      if (document.getElementById("wordOffsets").checked) {
+        cfg.enableWordTimeOffsets = true;
+      }
+      if (document.getElementById("wordConfidence").checked) {
+        cfg.enableWordConfidence = true;
+      }
+      return cfg;
+    }
+
+    /** Chunked base64 — same payload as Node Buffer.toString("base64") */
+    function bytesToBase64(bytes) {
+      const chunk = 0x8000;
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    // ─── Google recognize (speech:recognize) ───
+    async function recognizePcm(pcmBytes, config) {
+      const token = await getAccessToken();
+      const body = {
+        config,
+        audio: { content: bytesToBase64(pcmBytes) },
+      };
+      const t0 = performance.now();
+      const res = await fetch("https://speech.googleapis.com/v1/speech:recognize", {
+        method: "POST",
+        headers: apiHeaders(token),
+        body: JSON.stringify(body),
+      });
+      const json = await res.json();
+      const ms = Math.round(performance.now() - t0);
+      if (!res.ok) {
+        throw new Error(json.error?.message || JSON.stringify(json));
+      }
+      return { json, ms, text: extractTranscript(json.results) };
+    }
+
+    /** HumanSegmentTranscriber.drainFullSegments — fires during PTT */
+    function drainFullSegments(sampleRate) {
+      const segB = segmentBytes(sampleRate);
+      const stride = strideBytes(sampleRate);
+      while (segBuffer.byteLength >= segB) {
+        const segmentPcm = segBuffer.slice(0, segB);
+        segBuffer = segBuffer.slice(stride);
+        enqueueSegment(segmentPcm, sampleRate);
+      }
+    }
+
+    function enqueueSegment(segmentPcm, sampleRate) {
+      const index = segmentCount++;
+      const config = buildSttConfig(sampleRate);
+      const job = {
+        index,
+        promise: (async () => {
+          const minBytes = Math.round(sampleRate * 2 * MIN_PCM_SEC);
+          if (segmentPcm.byteLength < minBytes) return null;
+          const rms = computeRmsDb(segmentPcm);
+          if (rms < SILENT_DBFS) return null;
+          try {
+            const { json, ms, text } = await recognizePcm(segmentPcm, config);
+            return {
+              text,
+              json,
+              ms,
+              segmentIndex: index,
+              segmentBytes: segmentPcm.byteLength,
+              durationMs: pcm16DurationMs(segmentPcm.byteLength, sampleRate),
+              requestConfig: config,
+              rmsDb: rms,
+            };
+          } catch (err) {
+            return { error: err.message, segmentIndex: index, segmentBytes: segmentPcm.byteLength };
+          }
+        })(),
+      };
+      segmentJobs.push(job);
+      document.getElementById("statSegments").textContent = String(segmentJobs.length);
+    }
+
+    async function finalizeSegments(sampleRate) {
+      if (segBuffer.byteLength > 0) {
+        enqueueSegment(segBuffer, sampleRate);
+        segBuffer = new Uint8Array(0);
+      }
+
+      const allResponses = [];
+      const texts = [];
+      let totalSttMs = 0;
+
+      for (const job of segmentJobs) {
+        document.getElementById("pttStatus").textContent = `Awaiting segment ${job.index + 1}/${segmentJobs.length}…`;
+        const result = await job.promise;
+        if (!result) continue;
+        if (result.error) {
+          allResponses.push(result);
+          continue;
+        }
+        totalSttMs += result.ms;
+        allResponses.push({
+          segmentIndex: result.segmentIndex,
+          segmentBytes: result.segmentBytes,
+          durationMs: result.durationMs,
+          rmsDb: result.rmsDb,
+          requestConfig: result.requestConfig,
+          response: result.json,
+        });
+        if (result.text) texts.push(result.text);
+      }
+
+      return { allResponses, texts, totalSttMs };
+    }
+
+    async function runSttPipeline() {
+      if (!lastPcm || lastPcm.byteLength === 0) {
+        document.getElementById("pttStatus").textContent = "No audio captured.";
+        return;
+      }
+
+      const sampleRate = lastSampleRate;
+      const minBytes = Math.round(sampleRate * 2 * MIN_PCM_SEC);
+      if (lastPcm.byteLength < minBytes) {
+        document.getElementById("pttStatus").textContent = `Too short: ${lastPcm.byteLength}B < ${minBytes}B minimum`;
+        document.getElementById("pttStatus").className = "status err";
+        return;
+      }
+
+      const rms = computeRmsDb(lastPcm);
+      document.getElementById("statRms").textContent = String(rms);
+
+      // Re-segment from full PCM when using "Transcribe again" (jobs may already exist from PTT)
+      if (segmentJobs.length === 0) {
+        segBuffer = lastPcm;
+        drainFullSegments(sampleRate);
+        if (segBuffer.byteLength > 0) {
+          enqueueSegment(segBuffer, sampleRate);
+          segBuffer = new Uint8Array(0);
+        }
+      }
+
+      document.getElementById("statSegments").textContent = String(segmentJobs.length);
+      document.getElementById("pttStatus").textContent = `STT: ${segmentJobs.length} segment(s)…`;
+      document.getElementById("pttStatus").className = "status";
+
+      const { allResponses, texts, totalSttMs } = await finalizeSegments(sampleRate);
+      const merged = mergeSegmentTranscripts(texts);
+      document.getElementById("statSttMs").textContent = String(totalSttMs);
+      document.getElementById("rawJson").textContent = JSON.stringify(allResponses, null, 2);
+
+      const el = document.getElementById("transcript");
+      if (merged) {
+        el.textContent = merged;
+        el.className = "transcript";
+        document.getElementById("pttStatus").textContent = `Done — ${merged.length} chars, ${totalSttMs}ms STT`;
+        document.getElementById("pttStatus").className = "status ok";
+      } else {
+        el.textContent = "(empty transcript from Google)";
+        el.className = "transcript empty";
+        document.getElementById("pttStatus").textContent = "Google returned empty transcript";
+        document.getElementById("pttStatus").className = "status err";
+      }
+    }
+
+    // ─── Mic init (MeetingRoom.initAudio) — must run after user gesture ───
+    async function ensureAudioRunning() {
+      if (!audioCtx) throw new Error("Microphone not initialized");
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      if (audioCtx.state !== "running") {
+        throw new Error(`AudioContext is ${audioCtx.state} — click Enable microphone again`);
+      }
+    }
+
+    async function initMic() {
+      const sttRate = Number(document.getElementById("sampleRate").value) || DEFAULT_CAPTURE_RATE;
+
+      if (!audioCtx) {
+        audioCtx = new AudioContext({ sampleRate: sttRate });
+      }
+      await ensureAudioRunning();
+
+      captureSampleRate = audioCtx.sampleRate;
+      document.getElementById("statCaptureHz").textContent = String(captureSampleRate);
+
+      if (captureSampleRate !== sttRate) {
+        console.warn(`AudioContext sampleRate=${captureSampleRate}Hz (requested ${sttRate}Hz) — resampling to ${sttRate}Hz`);
+      }
+
+      if (micStream && processor) {
+        micReady = true;
+        return;
+      }
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: { ideal: 1 },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: { ideal: sttRate },
+        },
+      });
+
+      const source = audioCtx.createMediaStreamSource(micStream);
+      processor = audioCtx.createScriptProcessor(PROCESSOR_BUFFER, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        if (!isPtt) return;
+        const sttTarget = Number(document.getElementById("sampleRate").value) || DEFAULT_CAPTURE_RATE;
+        const input = e.inputBuffer.getChannelData(0);
+        const samples =
+          captureSampleRate === sttTarget
+            ? input
+            : downsampleFloat32(input, captureSampleRate, sttTarget);
+        const pcm16 = float32ToPcm16(samples);
+        const bytes = new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+        pcmChunks.push(bytes);
+        audioBytes += bytes.byteLength;
+        audioChunkCount++;
+        document.getElementById("statBytes").textContent = String(audioBytes);
+        document.getElementById("statChunks").textContent = String(audioChunkCount);
+
+        const merged = segBuffer.byteLength ? concatUint8([segBuffer, bytes]) : bytes;
+        segBuffer = merged;
+        drainFullSegments(sttTarget);
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      micReady = true;
+      document.getElementById("btnPtt").disabled = false;
+      document.getElementById("btnEnableMic").disabled = true;
+      document.getElementById("btnEnableMic").textContent = "Microphone enabled";
+      document.getElementById("pttStatus").textContent = gcpCredentials
+        ? "Mic ready — hold PTT or Space"
+        : "Mic ready — hold PTT to capture (load credentials for STT)";
+      document.getElementById("pttStatus").className = "status ok";
+    }
+
+    async function enableMicrophone() {
+      if (micInitPromise) return micInitPromise;
+      const btn = document.getElementById("btnEnableMic");
+      btn.disabled = true;
+      document.getElementById("pttStatus").textContent = "Requesting microphone access…";
+      document.getElementById("pttStatus").className = "status";
+
+      micInitPromise = initMic()
+        .catch((err) => {
+          micReady = false;
+          btn.disabled = false;
+          document.getElementById("pttStatus").textContent = `Mic error: ${err.message}`;
+          document.getElementById("pttStatus").className = "status err";
+          throw err;
+        })
+        .finally(() => {
+          micInitPromise = null;
+        });
+
+      return micInitPromise;
+    }
+
+    function resetCapture() {
+      pcmChunks = [];
+      audioBytes = 0;
+      audioChunkCount = 0;
+      segBuffer = new Uint8Array(0);
+      segmentJobs = [];
+      segmentCount = 0;
+      document.getElementById("statBytes").textContent = "0";
+      document.getElementById("statChunks").textContent = "0";
+      document.getElementById("statPttMs").textContent = "0";
+      document.getElementById("statAudioMs").textContent = "0";
+      document.getElementById("statSttMs").textContent = "—";
+      document.getElementById("statSegments").textContent = "—";
+      document.getElementById("statRms").textContent = "—";
+    }
+
+    async function startPtt() {
+      if (isPtt) return;
+      if (!micReady) {
+        document.getElementById("pttStatus").textContent = "Enable microphone first, then hold PTT";
+        document.getElementById("pttStatus").className = "status err";
+        return;
+      }
+      await ensureAudioRunning();
+      resetCapture();
+      isPtt = true;
+      pttStartedAt = performance.now();
+      document.getElementById("btnPtt").classList.add("active");
+      document.getElementById("btnPtt").textContent = "Recording… (release)";
+      document.getElementById("pttStatus").textContent = "PTT active — streaming PCM chunks";
+    }
+
+    async function endPtt() {
+      if (!isPtt) return;
+      isPtt = false;
+      const pttMs = Math.round(performance.now() - pttStartedAt);
+      document.getElementById("btnPtt").classList.remove("active");
+      document.getElementById("btnPtt").textContent = "Hold to speak (Space)";
+      document.getElementById("statPttMs").textContent = String(pttMs);
+
+      lastSampleRate = Number(document.getElementById("sampleRate").value) || DEFAULT_CAPTURE_RATE;
+      lastPcm = pcmChunks.length ? concatUint8(pcmChunks) : new Uint8Array(0);
+      document.getElementById("statAudioMs").textContent = String(pcm16DurationMs(lastPcm.byteLength, lastSampleRate));
+
+      document.getElementById("btnDownload").disabled = lastPcm.byteLength === 0;
+      document.getElementById("btnTranscribe").disabled = lastPcm.byteLength === 0 || !gcpCredentials;
+
+      if (!gcpCredentials) {
+        document.getElementById("pttStatus").textContent = "Captured audio — load credentials to transcribe";
+        return;
+      }
+
+      // Flush tail segment (HumanSegmentTranscriber.finalize)
+      const rate = lastSampleRate;
+      if (segBuffer.byteLength > 0) {
+        enqueueSegment(segBuffer, rate);
+        segBuffer = new Uint8Array(0);
+      }
+
+      try {
+        await runSttPipeline();
+      } catch (err) {
+        document.getElementById("pttStatus").textContent = `STT error: ${err.message}`;
+        document.getElementById("pttStatus").className = "status err";
+        document.getElementById("rawJson").textContent = JSON.stringify({ error: err.message }, null, 2);
+      }
+    }
+
+    document.getElementById("btnEnableMic").addEventListener("click", () => {
+      void enableMicrophone();
+    });
+
+    document.getElementById("btnPtt").addEventListener("mousedown", () => { void startPtt(); });
+    document.getElementById("btnPtt").addEventListener("mouseup", () => endPtt());
+    document.getElementById("btnPtt").addEventListener("mouseleave", () => { if (isPtt) endPtt(); });
+    document.getElementById("btnPtt").addEventListener("touchstart", (e) => { e.preventDefault(); startPtt(); }, { passive: false });
+    document.getElementById("btnPtt").addEventListener("touchend", (e) => { e.preventDefault(); endPtt(); });
+
+    window.addEventListener("keydown", (e) => {
+      if (e.code === "Space" && !e.repeat) { e.preventDefault(); void startPtt(); }
+    });
+    window.addEventListener("keyup", (e) => {
+      if (e.code === "Space") { e.preventDefault(); endPtt(); }
+    });
+
+    document.getElementById("btnDownload").addEventListener("click", () => {
+      if (!lastPcm?.byteLength) return;
+      const rate = lastSampleRate || DEFAULT_CAPTURE_RATE;
+      const blob = pcmToWav(lastPcm, rate);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `stt-capture-${rate}hz-${Date.now()}.wav`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+
+    document.getElementById("btnTranscribe").addEventListener("click", () => {
+      segmentJobs = [];
+      segmentCount = 0;
+      segBuffer = new Uint8Array(0);
+      runSttPipeline().catch((err) => {
+        document.getElementById("pttStatus").textContent = `STT error: ${err.message}`;
+        document.getElementById("pttStatus").className = "status err";
+      });
+    });
+
+    document.getElementById("sampleRate").addEventListener("change", () => {
+      if (micReady) {
+        document.getElementById("pttStatus").textContent = "Sample rate changed — reload page to re-init AudioContext at new rate";
+        document.getElementById("pttStatus").className = "status";
+      }
+    });
+  </script>
+</body>
+</html>

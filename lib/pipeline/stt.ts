@@ -7,7 +7,6 @@ import {
 import { getEnv } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { logApiRequest, logApiResponse, previewText } from "@/lib/logger/apiLog";
-import { generateJsonReply } from "./geminiChat";
 import { stripWavHeaderIfPresent } from "./wav";
 
 let client: SpeechClient | null = null;
@@ -22,7 +21,6 @@ function getClient(): SpeechClient {
 
 export const STT_SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
 const MIN_BYTES = STT_SAMPLE_RATE * 2 * 0.1;
-const STT_CLEANUP_MIN_DURATION_SEC = 10;
 
 export { estimateFinalSttTimeoutMs, getHumanSttSegmentBytes } from "@/lib/helpers/audio/pcm";
 
@@ -36,8 +34,6 @@ export interface TranscribeOptions {
   captureSampleRate?: number;
   /** Optional phrase hints for Google STT speechContexts (boost 15). */
   speechContexts?: string[];
-  /** Skip Gemini post-cleanup (segment transcriber merges first, then cleans once). */
-  skipGeminiCleanup?: boolean;
 }
 
 function detectContainerFormat(header: Buffer): string {
@@ -139,25 +135,6 @@ async function recognizePcm(
   return "";
 }
 
-export async function cleanupSttTranscript(raw: string): Promise<string> {
-  const system = `You fix phonetic speech-to-text errors while preserving the speaker's intent and meaning.
-Do not add, remove, or reinterpret ideas — only correct likely misheard words and punctuation.
-Return JSON: {"cleaned":"<corrected transcript>"}`;
-  const user = `Raw STT transcript:\n"${raw}"`;
-
-  try {
-    const parsed = await generateJsonReply(system, user);
-    const cleaned = typeof parsed.cleaned === "string" ? parsed.cleaned.trim() : "";
-    if (cleaned) {
-      logger.info("STT", `Gemini STT cleanup applied (${raw.length}→${cleaned.length} chars)`);
-      return cleaned;
-    }
-  } catch (err) {
-    logger.warn("STT", `Gemini STT cleanup failed: ${(err as Error).message}`);
-  }
-  return raw;
-}
-
 function logSttDiagnostics(
   rawAudio: Buffer,
   audio: Buffer,
@@ -238,20 +215,10 @@ export async function transcribePcm16(
       };
     }
 
-    const durationSec = pcm16DurationSec(audio.byteLength, STT_SAMPLE_RATE);
     const sttConfig = buildSttConfig(STT_SAMPLE_RATE, speechContexts);
     logSttDiagnostics(rawAudio, audio, hadWavHeader, rmsDb, sttConfig, captureSampleRate);
 
     let text = await recognizePcm(audio, sttConfig, rmsDb);
-
-    if (
-      text &&
-      !options?.skipGeminiCleanup &&
-      durationSec > STT_CLEANUP_MIN_DURATION_SEC &&
-      getEnv().GEMINI_STT_CLEANUP
-    ) {
-      text = await cleanupSttTranscript(text);
-    }
 
     if (text) {
       return { text, detail: "ok" };

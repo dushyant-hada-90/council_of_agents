@@ -4,13 +4,13 @@ import { AudioMixer } from "./audioMixer";
 import { logger } from "../lib/logger";
 import type { MaxAiTurnsBeforeHuman } from "../lib/agents/types";
 import { InterruptPlaybackReport } from "./conferenceTypes";
-import { agentNamesMatch, normalizeAgentNameToken } from "../lib/helpers/nameMatching";
 import { SessionRecorder } from "./sessionRecorder";
 import {
   ConversationTurn,
   pickSpeakerAndRespondWithGemini,
-  shouldContinueChainWithGemini,
+  requestHandoffWithGemini,
 } from "../lib/pipeline/nextSpeakerRouter";
+import type { LiveMeetingMetadata } from "../lib/prompts/prompts";
 import type { HumanTranscriptMeta } from "../lib/pipeline/humanTranscribe";
 import { getEnv } from "../lib/env";
 
@@ -25,11 +25,6 @@ export type OrchestratorState =
 // ─── Events emitted to the client gateway ────────────────────────────────────
 
 export type { InterruptPlaybackReport } from "./conferenceTypes";
-
-type SpeechAddressee =
-  | { kind: "everyone" }
-  | { kind: "human" }
-  | { kind: "agent"; agent: AgentRecord };
 
 export type TranscriptAddresseeMeta = {
   kind: "everyone" | "human" | "agent";
@@ -74,6 +69,8 @@ interface AgentRecord {
   name: string;
   session: AgentSession;
   systemPrompt: string;
+  roleSummary: string;
+  peerProfile: string;
   /** Higher weight = more likely to be selected. Starts at 1.0. */
   selectionWeight: number;
   /** Unix timestamp of when this agent last finished speaking. 0 = never. */
@@ -112,31 +109,15 @@ export class Orchestrator extends EventEmitter {
   private readonly silenceTimeoutMs: number;
 
   /**
-   * Fallback probability when Gemini is unavailable for chain continuation decisions.
-   * The FIRST reaction after a human turn is always guaranteed.
-   */
-  private readonly CHAIN_REACTION_PROBABILITY = 0.80;
-
-  /**
    * Delay before a chain-reaction agent speaks (ms).
    */
   private readonly CHAIN_REACTION_DELAY_MS = 900;
-
-  /** Hard backstop — Gemini normally decides when chains end; this prevents runaway loops. */
-  private readonly CHAIN_SAFETY_MAX = 12;
-
-  /** How many agent-to-agent turns have happened in the current chain. */
-  private chainTurnCount = 0;
 
   /**
    * Agents that completed response.done in the current round (since human last spoke).
    * Used on interrupt to roll back unheard assistant context.
    */
   private agentsCompletedThisRound: string[] = [];
-
-  /** Agent ids who spoke in the last N turns — blocked from random fallback entirely. */
-  private recentAgentSpeakerIds: string[] = [];
-  private readonly RECENT_SPEAKER_BLOCK_TURNS = 2;
 
   /** Waiting for human STT before picking who responds. */
   private awaitingHumanTranscript = false;
@@ -146,14 +127,11 @@ export class Orchestrator extends EventEmitter {
   private readonly transcriptFallbackMs = getEnv().HUMAN_STT_TIMEOUT_MS;
   private transcriptStatusProvider: (() => string) | null = null;
 
-  /** Last human utterance from STT — used for name routing. */
+  /** Last human utterance from STT. */
   private lastHumanTranscript: string | null = null;
 
-  /** True when the human directly named someone this turn — skip auto chain afterward. */
-  private humanAddressedThisRound = false;
-
-  /** Follow-up turn where the last speaker asks the Human an engaging question. */
-  private engagementTurnActive = false;
+  /** Follow-up turn where the last speaker invites the human with a pre-generated handoff line. */
+  private handoffTurnActive = false;
 
   /** Rolling transcript for Gemini turn-taking (trimmed). */
   private conversationTurns: ConversationTurn[] = [];
@@ -171,10 +149,15 @@ export class Orchestrator extends EventEmitter {
   /** Display name of the live human participant. */
   private readonly humanName: string;
 
+  private readonly meetingTopic: string;
+  private readonly meetingGoal: string;
+  private readonly meetingContext: string;
+  private readonly meetingInstructions: string;
+
   /** Max agent-only turns before inviting human participation. */
   private readonly maxAiTurnsBeforeHuman: MaxAiTurnsBeforeHuman;
 
-  /** Agent turns since human last spoke (excluding engagement). */
+  /** Agent turns since human last spoke (excluding handoff invite). */
   private aiTurnsSinceHuman = 0;
 
   /** Bumped on interrupt so stale async Gemini picks are ignored. */
@@ -188,46 +171,27 @@ export class Orchestrator extends EventEmitter {
   /** Agent id the active chain turn is reacting to (if chain). */
   private replyChainFromId: string | null = null;
 
-  /** Alternate spellings Whisper may produce for agent first names. */
-  private static readonly NAME_ALIASES: Record<string, string[]> = {
-    sara: ["sara", "sarah", "sera", "farah", "sarahh"],
-    rohan: ["rohan", "rohaan"],
-    priya: ["priya", "preeya", "priyah"],
-    vikram: ["vikram", "vikrum"],
-    anika: ["anika", "anica", "anneka"],
-  };
-
-  /** Common Whisper mishearings of participant names in human speech. */
-  private static readonly HUMAN_SPEAKER_HINTS: Record<string, string> = {
-    farah: "Sara",
-    sarah: "Sara",
-    sera: "Sara",
-  };
-
-  /** Per-agent dissent cue — breaks the agree-and-rephrase loop. */
-  private static readonly DISSENT_CUES: Record<string, string> = {
-    "agent-rohan":
-      "The table may be converging. You're not convinced — what's the angle they're missing? Push on one assumption.",
-    "agent-vikram":
-      "The group just reached consensus. As devil's advocate, poke a hole — what's the failure mode nobody said?",
-    "agent-priya":
-      "This is getting too practical. Bring it back to the human cost, meaning, or emotional truth underneath.",
-    "agent-anika":
-      "Claims are flying without evidence. Ask for proof, cite a counterexample, or name the bias in the last point.",
-    "agent-sara":
-      "The table may be trading dignity for efficiency. Push back — authentic connection is your stake, not neutral facilitation.",
-  };
-
   constructor(
     mixer: AudioMixer,
     recorder?: SessionRecorder,
-    options?: { humanName?: string; maxAiTurnsBeforeHuman?: MaxAiTurnsBeforeHuman }
+    options?: {
+      humanName?: string;
+      maxAiTurnsBeforeHuman?: MaxAiTurnsBeforeHuman;
+      topic?: string;
+      goal?: string;
+      context?: string;
+      instructions?: string;
+    }
   ) {
     super();
     this.mixer = mixer;
     this.routingEnabled = true;
     this.recorder = recorder ?? null;
     this.humanName = options?.humanName ?? "You";
+    this.meetingTopic = options?.topic ?? "";
+    this.meetingGoal = options?.goal ?? "";
+    this.meetingContext = options?.context ?? "";
+    this.meetingInstructions = options?.instructions ?? "";
     this.maxAiTurnsBeforeHuman = options?.maxAiTurnsBeforeHuman ?? getEnv().MAX_AI_TURNS_BEFORE_HUMAN;
     this.silenceTimeoutMs = getEnv().POST_TRANSCRIPT_SILENCE_MS;
     logger.info("ORCHESTRATOR", "Gemini next-speaker router enabled");
@@ -240,12 +204,20 @@ export class Orchestrator extends EventEmitter {
 
   // ─── Agent registration ─────────────────────────────────────────────────────
 
-  public registerAgent(session: AgentSession, name: string, systemPrompt = ""): void {
+  public registerAgent(
+    session: AgentSession,
+    name: string,
+    systemPrompt = "",
+    roleSummary = "",
+    peerProfile = ""
+  ): void {
     const record: AgentRecord = {
       id: session.agentId,
       name,
       session,
       systemPrompt,
+      roleSummary,
+      peerProfile,
       selectionWeight: 1.0,
       lastSpokAt: 0,
       speakCount: 0,
@@ -270,17 +242,15 @@ export class Orchestrator extends EventEmitter {
       const agent = this.findAgent(agentId);
       if (agent && text.trim()) {
         this.appendConversationTurn("agent", agentId, agent.name, text);
-        const addressee = this.describeAddressee(text, agent);
         const replyTo = this.buildReplyToMeta();
         this.recorder?.recordTurn({
           speakerId: agentId,
           speaker: agent.name,
           role: "agent",
           text: text.trim(),
-          addressee,
           replyTo,
         });
-        this.emit("transcript", agentId, agent.name, text, false, addressee, replyTo);
+        this.emit("transcript", agentId, agent.name, text, false, undefined, replyTo);
       }
     });
 
@@ -309,13 +279,10 @@ export class Orchestrator extends EventEmitter {
     this.clearChainTimer();
     this.clearTranscriptFallbackTimer();
     this.awaitingHumanTranscript = false;
-    this.humanAddressedThisRound = false;
-    this.engagementTurnActive = false;
+    this.handoffTurnActive = false;
     this.lastHumanTranscript = null;
-    this.chainTurnCount = 0;
     this.aiTurnsSinceHuman = 0;
     this.agentsCompletedThisRound = [];
-    this.recentAgentSpeakerIds = [];
     this.selectionGeneration++;
 
     if (this.selectionInProgress) {
@@ -334,7 +301,7 @@ export class Orchestrator extends EventEmitter {
 
     // Drop active speaker before cancel so late response.done cannot chain another turn
     this.activeAgent = null;
-    this.engagementTurnActive = false;
+    this.handoffTurnActive = false;
 
     // 1. Tell client to hard-flush playout queue (stale epoch frames dropped server-side too)
     this.emit("stopClientAudio", playoutEpoch ?? 0);
@@ -509,7 +476,6 @@ export class Orchestrator extends EventEmitter {
       "ORCHESTRATOR",
       `Human speech END — awaiting transcript before selecting responder… (STT timeout ${timeoutMs}ms)`
     );
-    this.chainTurnCount = 0;
     this.agentsCompletedThisRound = [];
     this.awaitingHumanTranscript = true;
     this.transitionTo("DECIDING", "human released PTT");
@@ -545,7 +511,6 @@ export class Orchestrator extends EventEmitter {
         logger.warn("ORCHESTRATOR", `Human transcript empty (${meta.source}): ${meta.detail}`);
       }
       this.lastHumanTranscript = null;
-      this.humanAddressedThisRound = false;
       this.transitionTo("IDLE", "empty transcript");
       const detail = meta?.detail?.trim();
       const notice =
@@ -565,7 +530,6 @@ export class Orchestrator extends EventEmitter {
       role: "human",
       text: text.trim(),
     });
-    this.humanAddressedThisRound = false;
     this.scheduleAgentSelection();
   }
 
@@ -615,234 +579,22 @@ export class Orchestrator extends EventEmitter {
     }
   }
 
-  private humanNamePattern(): string {
-    return `human|${this.humanName.toLowerCase()}`;
+  private buildMeetingMetadata(agents: AgentRecord[]): LiveMeetingMetadata {
+    return {
+      humanName: this.humanName,
+      topic: this.meetingTopic,
+      goal: this.meetingGoal,
+      context: this.meetingContext,
+      instructions: this.meetingInstructions,
+      agents: agents.map((a) => ({
+        name: a.name,
+        systemPrompt: a.systemPrompt,
+        roleSummary: a.roleSummary,
+        peerProfile: a.peerProfile,
+      })),
+    };
   }
 
-  /**
-   * True only when the speaker is inviting the live human to respond — not when
-   * "human" appears in general speech ("human nature", "Human, the theorem…").
-   */
-  private isDirectQuestionToHuman(lower: string): boolean {
-    const name = this.humanNamePattern();
-    const addressesHuman =
-      new RegExp(`^\\s*(?:${name})\\s*[,?!:]`, "i").test(lower) ||
-      new RegExp(`\\b(hey|hi|hello|okay|ok)\\s+(?:${name})\\s*[,?!]`, "i").test(lower) ||
-      new RegExp(
-        `\\b(?:${name})\\s*,\\s*(what|how|where|when|why|do you|would you|can you|are you|did you)\\b`,
-        "i"
-      ).test(lower);
-
-    if (!addressesHuman) {
-      if (new RegExp(`^\\s*(?:${name})\\b`, "i").test(lower) && /\?/.test(lower)) return true;
-      return false;
-    }
-
-    return (
-      /\?/.test(lower) ||
-      new RegExp(`\\b(what|how|where|when|why)\\b[^.?!]{0,50}\\b(you|human|${this.humanName})\\b`, "i").test(
-        lower
-      ) ||
-      /\b(your turn|hear from you|like to hear from you|want your take)\b/i.test(lower) ||
-      /\bwhat do you think\b/i.test(lower) ||
-      new RegExp(`\\b(tell me|ask)\\b[^.?!]{0,40}\\b(you|human|${this.humanName})\\b`, "i").test(lower)
-    );
-  }
-
-  private scoreHumanAsAddressee(lower: string): number {
-    if (!this.isDirectQuestionToHuman(lower)) return 0;
-    let score = 20;
-    if (new RegExp(`^\\s*(?:${this.humanNamePattern()})\\s*[,?!:]`, "i").test(lower)) score += 8;
-    if (/\?/.test(lower)) score += 6;
-    return score;
-  }
-
-  /** Open group broadcast — no single directed recipient. */
-  private isBroadcastToEveryone(lower: string): boolean {
-    return (
-      /\beveryone\b/i.test(lower) ||
-      /\beverybody\b/i.test(lower) ||
-      /\ball of you\b/i.test(lower) ||
-      /\byou all\b/i.test(lower) ||
-      /\bthe (whole )?room\b/i.test(lower) ||
-      /\bthe table\b/i.test(lower) ||
-      /\banyone\b/i.test(lower) ||
-      /\banybody\b/i.test(lower) ||
-      /\bwhat do you (guys |all )?think\b/i.test(lower)
-    );
-  }
-
-  /**
-   * Who is this utterance directed at? Used for agent→agent / agent→human routing.
-   * Excludes the speaker from agent matches.
-   */
-  private resolveSpeechAddressee(text: string, speaker?: AgentRecord): SpeechAddressee {
-    const lower = text.toLowerCase();
-    const humanScore = this.scoreHumanAsAddressee(lower);
-    const mentioned = this.getMentionedAgents(text).filter((a) => a.id !== speaker?.id);
-
-    if (mentioned.length === 1 && humanScore < 12) {
-      const score = this.scoreAgentAsAddressee(lower, mentioned[0]!);
-      if (score >= 8) return { kind: "agent", agent: mentioned[0]! };
-    }
-
-    if (mentioned.length > 1) {
-      const scored = mentioned
-        .map((agent) => ({ agent, score: this.scoreAgentAsAddressee(lower, agent) }))
-        .sort((a, b) => b.score - a.score);
-      const best = scored[0]!;
-      if (scored.length >= 2 && best.score >= scored[1]!.score + 3) {
-        return { kind: "agent", agent: best.agent };
-      }
-      if (best.score >= 8) return { kind: "agent", agent: best.agent };
-    }
-
-    if (humanScore > 0 && mentioned.length === 0) return { kind: "human" };
-
-    if (humanScore > 0 && mentioned.length > 0) {
-      const bestAgent = mentioned
-        .map((agent) => ({ agent, score: this.scoreAgentAsAddressee(lower, agent) }))
-        .sort((a, b) => b.score - a.score)[0]!;
-      if (humanScore >= bestAgent.score + 4) return { kind: "human" };
-      if (bestAgent.score >= 8) return { kind: "agent", agent: bestAgent.agent };
-    }
-
-    if (this.isBroadcastToEveryone(lower)) return { kind: "everyone" };
-
-    return { kind: "everyone" };
-  }
-
-  private describeAddressee(text: string, speaker: AgentRecord): TranscriptAddresseeMeta {
-    const target = this.resolveSpeechAddressee(text, speaker);
-    if (target.kind === "human") return { kind: "human" };
-    if (target.kind === "agent") return { kind: "agent", name: target.agent.name };
-    return { kind: "everyone" };
-  }
-
-  private nameAppearsInText(lower: string, agentName: string): boolean {
-    const canonical = agentName.toLowerCase();
-    const aliases = Orchestrator.NAME_ALIASES[canonical] ?? [canonical];
-    const forms = new Set<string>([canonical, ...aliases.map((a) => a.toLowerCase())]);
-    for (const alias of aliases) {
-      forms.add(normalizeAgentNameToken(alias));
-    }
-    forms.add(normalizeAgentNameToken(canonical));
-
-    if ([...forms].some((form) => new RegExp(`\\b${this.escapeRegex(form)}\\b`, "i").test(lower))) {
-      return true;
-    }
-
-    // Token-level match for compact spellings Whisper may produce
-    const tokens = lower.match(/\b[a-z']+\b/g) ?? [];
-    return tokens.some((tok) => {
-      const norm = normalizeAgentNameToken(tok);
-      return norm === normalizeAgentNameToken(canonical);
-    });
-  }
-
-  private escapeRegex(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  /** All agents whose name appears anywhere in the human transcript. */
-  private getMentionedAgents(text: string): AgentRecord[] {
-    const lower = text.toLowerCase();
-    return this.agents.filter((a) => this.nameAppearsInText(lower, a.name));
-  }
-
-  /** Name appears as topic / negated identity, not as someone being spoken to. */
-  private isNameReferencedNotAddressed(lower: string, alias: string): boolean {
-    const a = this.escapeRegex(alias);
-    const negated = [
-      new RegExp(`\\b(won'?t|will not|not|never|don'?t)\\b[^.?!]{0,40}\\b(speak|talk|respond)\\s+(as|for|like)\\s+${a}\\b`, "i"),
-      new RegExp(`\\b(speak|talk)\\s+(as|for|like)\\s+${a}\\b[^.?!]{0,24}\\b(but|instead|however)\\b`, "i"),
-      new RegExp(`\\b(instead of|rather than|unlike)\\s+${a}\\b`, "i"),
-      new RegExp(`\\b${a}'s\\s+(take|view|perspective|angle|role|position|lens)\\b`, "i"),
-      new RegExp(`\\bfrom\\s+${a}'s\\s+(perspective|view|angle)\\b`, "i"),
-    ];
-    return negated.some((p) => p.test(lower));
-  }
-
-  private scoreAgentAsAddressee(lower: string, agent: AgentRecord): number {
-    const name = agent.name.toLowerCase();
-    const aliases = Orchestrator.NAME_ALIASES[name] ?? [name];
-    let score = 0;
-
-    for (const alias of aliases) {
-      if (!new RegExp(`\\b${alias}\\b`, "i").test(lower)) continue;
-      if (this.isNameReferencedNotAddressed(lower, alias)) continue;
-      score += 5;
-
-      if (new RegExp(`^\\s*(hey|hi|hello|yo|okay|ok)\\s+${alias}\\b`, "i").test(lower)) score += 15;
-      if (new RegExp(`\\b(hey|hi|hello|yo)\\s+${alias}\\b`, "i").test(lower)) score += 12;
-      if (new RegExp(`\\b${alias}\\s*[,?!:]`, "i").test(lower)) score += 10;
-      if (new RegExp(`\\b${alias}'s\\b`, "i").test(lower)) score += 14;
-      if (new RegExp(`\\babout\\s+${alias}\\b`, "i").test(lower)) score += 14;
-      if (new RegExp(`\\bfor\\s+${alias}\\b`, "i").test(lower)) score += 10;
-      if (new RegExp(`\\bto\\s+${alias}\\b`, "i").test(lower)) score += 10;
-      if (new RegExp(`\\b(ask|tell)\\s+${alias}\\b`, "i").test(lower)) score += 14;
-      if (new RegExp(`\\b(ask|tell|hear from|talk to)\\b[^.?!]{0,40}\\b${alias}\\b`, "i").test(lower)) score += 12;
-      if (new RegExp(`\\b(what|how)\\b[^.?!]{0,30}\\b${alias}\\b`, "i").test(lower)) score += 10;
-      if (new RegExp(`\\b${alias}\\b[^.?!]{0,50}\\?`, "i").test(lower)) score += 8;
-      if (lower.trimStart().startsWith(alias)) score += 8;
-    }
-
-    return score;
-  }
-
-  /**
-   * Score how strongly the human invited this agent to speak (not merely mentioned them).
-   */
-  private scoreInvitedToSpeak(lower: string, agent: AgentRecord): number {
-    const name = agent.name.toLowerCase();
-    const aliases = Orchestrator.NAME_ALIASES[name] ?? [name];
-    let score = 0;
-
-    for (const alias of aliases) {
-      if (!new RegExp(`\\b${alias}\\b`, "i").test(lower)) continue;
-
-      if (
-        new RegExp(
-          `\\b(hear from|like to hear from|want to hear from|turn to|go to|let's hear from|i would like to hear from|i'd like to hear from)\\b[^.?!]{0,80}\\b${alias}\\b`,
-          "i"
-        ).test(lower)
-      ) {
-        score += 30;
-      }
-      if (new RegExp(`\\b(ask|tell)\\s+${alias}\\b`, "i").test(lower)) score += 22;
-      if (new RegExp(`^\\s*(hey|hi|hello|okay|ok)\\s+${alias}\\b`, "i").test(lower)) score += 18;
-      if (new RegExp(`\\b${alias}\\s*[,?!:]`, "i").test(lower)) score += 14;
-      if (new RegExp(`\\b(what do you think|your take|your view)\\b[^.?!]{0,40}\\b${alias}\\b`, "i").test(lower)) {
-        score += 10;
-      }
-    }
-
-    return score;
-  }
-
-  /** True when the human clearly invited this agent to take the floor. */
-  private isInvitedToSpeak(text: string, agent: AgentRecord): boolean {
-    return this.scoreInvitedToSpeak(text.toLowerCase(), agent) >= 12;
-  }
-
-  /**
-   * Deterministic server fallback when merged Gemini fails after retries.
-   * Prefers agents not on recent-speaker cooldown; tie-break by lowest speakCount.
-   */
-  private pickServerFallbackAgent(pool: AgentRecord[]): AgentRecord {
-    const notRecent = pool.filter((a) => !this.isOnSpeakerCooldown(a.id));
-    const candidates = notRecent.length > 0 ? notRecent : pool.filter((a) => a.id !== this.lastFinishedSpeakerId);
-    const eligible = candidates.length > 0 ? candidates : pool;
-
-    return [...eligible].sort((a, b) => {
-      if (a.speakCount !== b.speakCount) return a.speakCount - b.speakCount;
-      return a.id.localeCompare(b.id);
-    })[0]!;
-  }
-
-  /**
-   * Pick the next speaker via Gemini merged turn, with server fallback on failure.
-   */
   private isolateAgentInput(selected: AgentRecord): void {
     for (const agent of this.agents) {
       if (agent.id !== selected.id) {
@@ -853,20 +605,17 @@ export class Orchestrator extends EventEmitter {
 
   // ─── Selection engine ────────────────────────────────────────────────────────
 
-  private trackAgentSpeaker(agentId: string): void {
-    this.recentAgentSpeakerIds.push(agentId);
-    while (this.recentAgentSpeakerIds.length > this.RECENT_SPEAKER_BLOCK_TURNS) {
-      this.recentAgentSpeakerIds.shift();
-    }
-  }
-
-  private isOnSpeakerCooldown(agentId: string): boolean {
-    return this.recentAgentSpeakerIds.includes(agentId);
-  }
-
   /** Clear uncommitted human audio on every agent except the one about to speak. */
   private async selectAndTriggerAgent(
-    selectionContext: "human_turn" | "chain" = "human_turn"
+    selectionContext: "human_turn" | "chain" = "human_turn",
+    options?: {
+      afterHuman?: boolean;
+      chainRecord?: {
+        afterSpeakerId: string;
+        afterSpeaker: string;
+        afterTranscript: string;
+      };
+    }
   ): Promise<void> {
     if (this.selectionInProgress) {
       logger.warn(
@@ -906,7 +655,9 @@ export class Orchestrator extends EventEmitter {
     let selectionLabel = "";
     let geminiPickReason: string | undefined;
     let preGeneratedText: string | undefined;
-    let serverFallback = false;
+
+    const afterHuman =
+      options?.afterHuman ?? selectionContext === "human_turn";
 
     if (this.routingEnabled) {
       this.emit("systemEvent", `GEMINI: routing + generating response…`);
@@ -918,14 +669,41 @@ export class Orchestrator extends EventEmitter {
           id: a.id,
           name: a.name,
           systemPrompt: a.systemPrompt,
+          roleSummary: a.roleSummary,
+          peerProfile: a.peerProfile,
         })),
+        meetingMetadata: this.buildMeetingMetadata(readyAgents),
+        afterHuman,
         lastSpeakerId: this.lastFinishedSpeakerId ?? undefined,
-        recentSpeakerIds: this.recentAgentSpeakerIds,
-        context: selectionContext,
-        scenarioHint: this.buildMergedTurnGuidance(selectionContext),
+        lastTranscript: options?.chainRecord?.afterTranscript,
       });
 
       if (generation !== this.selectionGeneration) return;
+
+      if (pick.source === "gemini" && pick.kind === "pause") {
+        const record = options?.chainRecord;
+        if (record) {
+          this.recorder?.recordChain({
+            afterSpeakerId: record.afterSpeakerId,
+            afterSpeaker: record.afterSpeaker,
+            afterTranscript: record.afterTranscript,
+            chainTurnCount: this.aiTurnsSinceHuman,
+            addresseeKind: "everyone",
+            decision: "pause",
+            source: "gemini",
+            reason: pick.reason,
+          });
+        }
+        this.emit(
+          "systemEvent",
+          `GEMINI: chain pauses${pick.reason ? ` — ${pick.reason}` : ""}`
+        );
+        this.playHandoffLine(
+          this.findAgent(record?.afterSpeakerId ?? this.lastFinishedSpeakerId ?? ""),
+          pick.handoff
+        );
+        return;
+      }
 
       if (pick.source === "gemini" && pick.kind === "human") {
         if (selectionContext === "chain") {
@@ -939,7 +717,6 @@ export class Orchestrator extends EventEmitter {
             label: `GEMINI: ${this.humanName}'s turn${pick.reason ? ` — ${pick.reason}` : ""}`,
           });
           this.emit("systemEvent", `GEMINI: ${this.humanName}'s turn (${pick.reason ?? "natural pause"})`);
-          this.chainTurnCount = 0;
           this.activeAgent = null;
           this.transitionTo("IDLE", "gemini human turn");
           this.emit("humanTurnReady");
@@ -959,6 +736,22 @@ export class Orchestrator extends EventEmitter {
           geminiPickReason = pick.reason;
           preGeneratedText = pick.response;
           selectionLabel = `GEMINI: ${agent.name}${pick.reason ? ` — ${pick.reason}` : ""}`;
+          if (!afterHuman && options?.chainRecord) {
+            this.recorder?.recordChain({
+              afterSpeakerId: options.chainRecord.afterSpeakerId,
+              afterSpeaker: options.chainRecord.afterSpeaker,
+              afterTranscript: options.chainRecord.afterTranscript,
+              chainTurnCount: this.aiTurnsSinceHuman,
+              addresseeKind: "everyone",
+              decision: "continue",
+              source: "gemini",
+              reason: pick.reason,
+            });
+            this.emit(
+              "systemEvent",
+              `GEMINI: chain continues${pick.reason ? ` — ${pick.reason}` : ""}`
+            );
+          }
         }
       } else if (pick.source === "failed") {
         logger.warn(
@@ -968,11 +761,13 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
-    if (!selectedAgent) {
-      selectedAgent = this.pickServerFallbackAgent(readyAgents);
-      serverFallback = true;
-      selectionLabel = `SERVER_FALLBACK: ${selectedAgent.name}`;
-      logger.warn("ORCHESTRATOR", `Using server fallback speaker: ${selectedAgent.name}`);
+    if (!selectedAgent || !preGeneratedText?.trim()) {
+      if (generation !== this.selectionGeneration) return;
+      logger.warn("ORCHESTRATOR", "No valid merged turn result — inviting human.");
+      this.emit("systemEvent", "ROUTING: failed — human turn");
+      this.transitionTo("IDLE", "routing failed");
+      this.emit("humanTurnReady");
+      return;
     }
 
     if (generation !== this.selectionGeneration) return;
@@ -980,7 +775,7 @@ export class Orchestrator extends EventEmitter {
     logger.info("ORCHESTRATOR", `Selected agent: ${selectedAgent.name}`);
     this.emit("systemEvent", `SELECTED: ${selectionLabel}`);
 
-    const routingSource = serverFallback ? "server_fallback" : "gemini";
+    const routingSource = "gemini";
     this.recorder?.recordRouting({
       context: selectionContext,
       selectedSpeakerId: selectedAgent.id,
@@ -990,334 +785,21 @@ export class Orchestrator extends EventEmitter {
       label: selectionLabel,
     });
 
-    const routingMethod: "merged_gemini" | "server_fallback" =
-      routingSource === "gemini" ? "merged_gemini" : "server_fallback";
     this.recorder?.markRoutingResult(
       selectedAgent.id,
       selectedAgent.name,
-      routingMethod,
+      "merged_gemini",
       geminiPickReason,
-      !!preGeneratedText
+      true
     );
 
     this.isolateAgentInput(selectedAgent);
-    const humanLine =
-      selectionContext === "human_turn" ? this.lastHumanTranscript : null;
     this.lastHumanTranscript = null;
 
-    if (humanLine && selectionContext === "human_turn") {
-      this.humanAddressedThisRound = this.isDirectlyAddressed(humanLine, selectedAgent);
-    }
-
-    let turnInstructions: string | undefined;
-    if (humanLine && selectionContext === "human_turn") {
-      turnInstructions = this.buildHumanTurnInstructions(
-        selectedAgent,
-        humanLine,
-        this.isDirectlyAddressed(humanLine, selectedAgent),
-        geminiPickReason
-      );
-    } else if (selectionContext === "chain") {
-      const fromSpeaker = this.lastFinishedSpeakerId
-        ? this.findAgent(this.lastFinishedSpeakerId)
-        : undefined;
-      const fromText = fromSpeaker?.session.getLastTranscript() ?? "";
-      if (fromSpeaker && fromText) {
-        const addressee = this.resolveSpeechAddressee(fromText, fromSpeaker);
-        const directlyAddressed =
-          addressee.kind === "agent" && addressee.agent.id === selectedAgent.id;
-        turnInstructions = this.buildChainTurnInstructions(
-          selectedAgent,
-          fromSpeaker,
-          fromText,
-          directlyAddressed
-        );
-      }
-    }
-
-    const skipDissent =
-      !!humanLine &&
-      selectionContext === "human_turn" &&
-      this.isDirectlyAddressed(humanLine, selectedAgent);
-
-    this.triggerAgentSpeech(
-      selectedAgent,
-      preGeneratedText
-        ? undefined
-        : turnInstructions
-          ? this.composeTurnInstructions(selectedAgent, turnInstructions, { skipDissent })
-          : this.composeTurnInstructions(selectedAgent, undefined, { skipDissent }),
-      selectionContext,
-      preGeneratedText
-    );
+    this.triggerAgentSpeech(selectedAgent, preGeneratedText, selectionContext);
     } finally {
       this.selectionInProgress = false;
     }
-  }
-
-  private buildMergedTurnGuidance(selectionContext: "human_turn" | "chain"): string {
-    const lines: string[] = [];
-
-    if (selectionContext === "human_turn" && this.lastHumanTranscript) {
-      const text = this.lastHumanTranscript;
-      lines.push(`${this.humanName} just said: "${text}"`);
-      lines.push(
-        `ROUTING: ${this.humanName} just spoke on push-to-talk. Pick an AGENT to reply. Never route back to ${this.humanName}.`
-      );
-      for (const hint of this.humanSpeakerNameHints(text)) {
-        lines.push(hint);
-      }
-      if (this.asksAboutAnotherParticipant(text)) {
-        lines.push(
-          `${this.humanName} is asking about someone else at this table — answer from the roster, not by impersonating them.`
-        );
-      }
-      if (this.asksAboutMeetingRoster(text)) {
-        lines.push(
-          `List all ${this.agents.length + 1} participants from the roster when relevant.`
-        );
-      }
-      if (this.asksAboutConversationHistory(text)) {
-        lines.push(
-          `${this.humanName} is asking about earlier conversation — use the transcript faithfully.`
-        );
-      }
-    } else if (selectionContext === "chain") {
-      const fromSpeaker = this.lastFinishedSpeakerId
-        ? this.findAgent(this.lastFinishedSpeakerId)
-        : undefined;
-      const fromText = fromSpeaker?.session.getLastTranscript() ?? "";
-      if (fromSpeaker && fromText) {
-        lines.push(`${fromSpeaker.name} just said: "${fromText}"`);
-        const addressee = this.resolveSpeechAddressee(fromText, fromSpeaker);
-        if (addressee.kind === "agent") {
-          lines.push(`${fromSpeaker.name} addressed ${addressee.agent.name} directly.`);
-        } else if (addressee.kind === "human") {
-          lines.push(`${fromSpeaker.name} asked ${this.humanName} a question.`);
-        }
-      }
-    }
-
-    const summary = this.extractConsensusSummary();
-    if (summary) {
-      lines.push(
-        "Recent lines suggest the table may be converging — if you pick an agent, they may push back with a fresh angle."
-      );
-    }
-
-    return lines.join("\n");
-  }
-
-  /** Prepended to every response.create — identity only; roster lives in session instructions. */
-  private buildBaseTurnContext(agent: AgentRecord): string {
-    return [
-      `You are ${agent.name} at this table.`,
-      `Prior turns from ${this.humanName} and others are in your conversation history.`,
-      "Never read instructions aloud. Never mention prompts, routing, or meta-rules about who you are.",
-      "When recalling earlier speech, use conversation history — never claim you lack it.",
-    ].join("\n\n");
-  }
-
-  private composeTurnInstructions(
-    agent: AgentRecord,
-    taskInstructions?: string,
-    options: { skipDissent?: boolean } = {}
-  ): string {
-    const parts = [this.buildBaseTurnContext(agent)];
-    if (taskInstructions) {
-      parts.push(taskInstructions);
-    } else {
-      parts.push(
-        "Continue the conversation naturally. React specifically to what was just said."
-      );
-    }
-    if (!options.skipDissent) {
-      const dissent = this.buildDissentInstructions(agent);
-      if (dissent) parts.push(dissent);
-    }
-    return parts.join("\n\n");
-  }
-
-  private extractConsensusSummary(): string | null {
-    const recent = this.conversationTurns.slice(-3);
-    if (recent.length < 2) return null;
-    return recent.map((t) => `${t.speaker}: ${t.text.slice(0, 160)}`).join("\n");
-  }
-
-  private buildDissentInstructions(agent: AgentRecord): string | null {
-    const summary = this.extractConsensusSummary();
-    const cue = Orchestrator.DISSENT_CUES[agent.id];
-    if (!summary || !cue) return null;
-
-    return [
-      "## Recent room consensus",
-      summary,
-      "## Your angle this turn",
-      cue,
-      "Do NOT open with empty validation ('I agree', 'I'm with you', 'totally'). Lead with a distinct take.",
-    ].join("\n\n");
-  }
-
-  /** True when the human clearly singled out this agent to respond. */
-  private isDirectlyAddressed(text: string, agent: AgentRecord): boolean {
-    return (
-      this.isInvitedToSpeak(text, agent) ||
-      this.scoreAgentAsAddressee(text.toLowerCase(), agent) >= 10
-    );
-  }
-
-  private extractTopicFocus(text: string): string | null {
-    const patterns = [
-      /\babout\s+(.+?)(?:\?|$)/i,
-      /\bon\s+(.+?)(?:\?|$)/i,
-      /\bregarding\s+(.+?)(?:\?|$)/i,
-      /\bwhat do you think (?:of|about)\s+(.+?)(?:\?|$)/i,
-    ];
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-      if (match?.[1]) {
-        const topic = match[1].trim().replace(/[?.!,]+$/, "");
-        if (topic.length >= 3 && topic.length <= 120) return topic;
-      }
-    }
-    return null;
-  }
-
-  private buildHumanTurnInstructions(
-    agent: AgentRecord,
-    text: string,
-    namedDirectly: boolean,
-    routingReason?: string
-  ): string {
-    const topic = this.extractTopicFocus(text);
-    const lines = [
-      `## This turn`,
-      `CONTEXT: ${this.humanName} just said: "${text}"`,
-      `Give ${agent.name}'s reply in first person — your own view, not anyone else's voice.`,
-    ];
-
-    if (namedDirectly) {
-      lines.push(
-        `${this.humanName} called on you by name. Acknowledge that briefly, then answer their question.`,
-        topic
-          ? `Stay on ${topic} — that is what they asked about.`
-          : `Answer what they actually asked — no generic tangent.`,
-      );
-      if (routingReason) {
-        lines.push(`(Internal note: ${routingReason})`);
-      }
-    } else {
-      lines.push(
-        `Respond to ${this.humanName}'s point directly.`,
-      );
-    }
-
-    if (this.asksAboutAnotherParticipant(text)) {
-      lines.push(
-        `${this.humanName} is asking about someone else at this table. Describe them from the roster — as a co-participant you know, not by impersonating them.`,
-        `Do NOT say you lack information about table-mates or need ${this.humanName} to introduce them.`
-      );
-    }
-
-    if (this.asksAboutMeetingRoster(text)) {
-      lines.push(
-        `List all ${this.agents.length + 1} participants from the roster above (5 agents + ${this.humanName}). Briefly describe anyone ${this.humanName} asks about.`
-      );
-    }
-
-    if (this.asksAboutConversationHistory(text)) {
-      lines.push(
-        `${this.humanName} is asking about earlier conversation. Answer from your conversation history.`,
-        `Find the relevant turn(s), then quote or summarize them faithfully. Do NOT ask ${this.humanName} to repeat what is already in your history.`,
-      );
-      if (/\bfirst question\b/i.test(text)) {
-        lines.push(
-          `Locate ${this.humanName}'s earliest line in the transcript — that is the first question. Include who answered and what they said next.`
-        );
-      }
-      if (/\b(repeat|what did .+ say|just (now )?said)\b/i.test(text)) {
-        lines.push(
-          "Repeat or paraphrase the requested speaker's most recent relevant line from the transcript."
-        );
-      }
-    }
-
-    for (const hint of this.humanSpeakerNameHints(text)) {
-      lines.push(hint);
-    }
-
-    return lines.join("\n");
-  }
-
-  private buildChainTurnInstructions(
-    agent: AgentRecord,
-    fromSpeaker: AgentRecord,
-    fromText: string,
-    directlyAddressed: boolean
-  ): string {
-    const topic = this.extractTopicFocus(fromText);
-    const lines = [
-      `## This turn`,
-      `CONTEXT: ${fromSpeaker.name} just said: "${fromText}"`,
-      `Give ${agent.name}'s reply in first person — react with your own view.`,
-    ];
-
-    if (directlyAddressed) {
-      lines.push(
-        `${fromSpeaker.name} called on you by name. Acknowledge their point, then give your take.`,
-        topic ? `Stay on ${topic}.` : `React to what they asked you specifically.`,
-      );
-    } else {
-      lines.push(
-        "Continue the conversation naturally. React specifically to what was just said.",
-        "If you disagree or have a strong reaction, say so directly."
-      );
-    }
-
-    return lines.join("\n");
-  }
-
-  private humanSpeakerNameHints(text: string): string[] {
-    const hints: string[] = [];
-    const lower = text.toLowerCase();
-    for (const [heard, actual] of Object.entries(Orchestrator.HUMAN_SPEAKER_HINTS)) {
-      if (new RegExp(`\\b${heard}\\b`, "i").test(lower)) {
-        hints.push(
-          `Name hint: when ${this.humanName} said "${heard}", they mean **${actual}** (conference participant) — check that speaker's lines in the transcript.`
-        );
-      }
-    }
-    return hints;
-  }
-
-  private asksAboutConversationHistory(text: string): boolean {
-    const lower = text.toLowerCase();
-    return (
-      /\b(first question|what did (i|he|she|they|we) (say|ask|answer|reply)|repeat what|what was said|what .+ said|earlier|just (now )?said|his (reply|answer)|her (reply|answer)|answer to me|you said|who asked)\b/i.test(
-        lower
-      ) || /\b(can you repeat|remind me|tell me again)\b/i.test(lower)
-    );
-  }
-
-  private asksAboutAnotherParticipant(text: string): boolean {
-    const lower = text.toLowerCase();
-    const self = lower;
-    const others = this.agents.filter((a) => this.nameAppearsInText(self, a.name));
-    if (others.length === 0) return false;
-    return (
-      /\b(strength|weakness|useful|good at|bad at|what does|who is|know|describe|tell me about)\b/i.test(
-        lower
-      ) || /\b(do for a living|job|work as)\b/i.test(lower)
-    );
-  }
-
-  private asksAboutMeetingRoster(text: string): boolean {
-    const lower = text.toLowerCase();
-    return (
-      /\b(how many|participant|people|who is (here|present|in)|name all|list all|in the meeting|at the table)\b/i.test(
-        lower
-      ) || /\b(describe (any|one|them)|who are you)\b/i.test(lower)
-    );
   }
 
   private buildReplyToMeta(): TranscriptReplyToMeta | undefined {
@@ -1333,9 +815,8 @@ export class Orchestrator extends EventEmitter {
 
   private triggerAgentSpeech(
     agent: AgentRecord,
-    extraInstructions?: string,
-    turnContext: "human_turn" | "chain" = "chain",
-    preGeneratedText?: string
+    preGeneratedText: string,
+    turnContext: "human_turn" | "chain" = "chain"
   ): void {
     this.activeTurnContext = turnContext;
     this.replyChainFromId = turnContext === "chain" ? this.lastFinishedSpeakerId : null;
@@ -1344,7 +825,6 @@ export class Orchestrator extends EventEmitter {
 
     agent.speakCount++;
     agent.lastSpokAt = Date.now();
-    this.trackAgentSpeaker(agent.id);
 
     if (turnContext === "human_turn") {
       this.recorder?.setLatencyWinner(agent.id, agent.name);
@@ -1354,23 +834,20 @@ export class Orchestrator extends EventEmitter {
     this.emit("systemEvent", `SPEAKING: ${agent.name}`);
 
     logger.startTimer(`turn_latency_${agent.id}_${agent.speakCount}`);
-    const hooks = this.recorder?.beginAgentTurn(agent.id, agent.name, turnContext, !!preGeneratedText);
-    agent.session.triggerResponse(
-      preGeneratedText ? undefined : (extraInstructions ?? this.composeTurnInstructions(agent)),
-      { preGeneratedText, hooks }
-    );
+    const hooks = this.recorder?.beginAgentTurn(agent.id, agent.name, turnContext, true);
+    agent.session.triggerResponse({ preGeneratedText, hooks });
   }
 
   private handleAgentDone(agentId: string): void {
     const speaker = this.findAgent(agentId);
     logger.logLatency("ORCHESTRATOR", `turn_latency_${agentId}_${this.activeAgent?.speakCount ?? 0}`);
 
-    // Engagement follow-up finished — queue will drain, Human's turn.
-    if (this.engagementTurnActive) {
-      this.engagementTurnActive = false;
-      logger.info("ORCHESTRATOR", `${speaker?.name ?? agentId} finished engagement question.`);
+    // Handoff invite finished — queue will drain, Human's turn.
+    if (this.handoffTurnActive) {
+      this.handoffTurnActive = false;
+      logger.info("ORCHESTRATOR", `${speaker?.name ?? agentId} finished handoff invite.`);
       this.emit("agentSpeakingEnd", agentId);
-      this.emit("systemEvent", `ENGAGE: ${speaker?.name ?? agentId} invited human`);
+      this.emit("systemEvent", `HANDOFF: ${speaker?.name ?? agentId} invited human`);
       this.activeAgent = null;
       this.transitionTo("IDLE", "human turn");
       this.emit("humanTurnReady");
@@ -1384,46 +861,16 @@ export class Orchestrator extends EventEmitter {
     this.emit("systemEvent", `DONE: ${speaker?.name ?? agentId} finished`);
     this.aiTurnsSinceHuman++;
 
-    // Human named someone — they answer, then invite Human back (no chain).
-    if (this.humanAddressedThisRound) {
-      this.humanAddressedThisRound = false;
-      this.chainTurnCount = 0;
-      this.beginEngagementQuestion(speaker);
-      return;
-    }
-
     const transcript = speaker?.session.getLastTranscript() ?? "";
-    const addressee = transcript ? this.resolveSpeechAddressee(transcript, speaker) : { kind: "everyone" as const };
-
-    if (addressee.kind === "human") {
-      logger.info("ORCHESTRATOR", `${speaker?.name ?? agentId} addressed ${this.humanName} — handoff after playout.`);
-      this.emit("systemEvent", `ADDRESSED: ${this.humanName} (${speaker?.name ?? agentId} asked them)`);
-      this.chainTurnCount = 0;
-      this.activeAgent = null;
-      this.transitionTo("IDLE", "agent asked human");
-      this.emit("humanTurnReady");
-      return;
-    }
-
-    // Chain reaction: agent-to-agent / open group after directed or broadcast turns.
-    void this.evaluateChainContinuation(speaker, agentId, transcript, addressee);
+    void this.evaluateChainContinuation(speaker, agentId, transcript);
   }
 
   private async evaluateChainContinuation(
     speaker: AgentRecord | undefined,
     agentId: string,
-    transcript: string,
-    addressee: SpeechAddressee
+    transcript: string
   ): Promise<void> {
     const generation = this.selectionGeneration;
-
-    const addresseeKind =
-      addressee.kind === "human"
-        ? "human"
-        : addressee.kind === "agent"
-          ? "agent"
-          : "everyone";
-    const addresseeName = addressee.kind === "agent" ? addressee.agent.name : undefined;
 
     if (this.aiTurnsSinceHuman >= this.maxAiTurnsBeforeHuman) {
       logger.info(
@@ -1435,155 +882,108 @@ export class Orchestrator extends EventEmitter {
         afterSpeakerId: agentId,
         afterSpeaker: speaker?.name ?? agentId,
         afterTranscript: transcript,
-        chainTurnCount: this.chainTurnCount,
-        addresseeKind,
-        addresseeName,
+        chainTurnCount: this.aiTurnsSinceHuman,
+        addresseeKind: "everyone",
         decision: "pause",
         source: "fallback",
         reason: `max AI turns (${this.maxAiTurnsBeforeHuman}) before human`,
       });
-      this.chainTurnCount = 0;
-      this.beginEngagementQuestion(speaker);
+      void this.requestHandoffLine(speaker, transcript);
       return;
     }
 
-    if (this.chainTurnCount >= this.CHAIN_SAFETY_MAX) {
-      logger.info("ORCHESTRATOR", `Chain safety cap (${this.CHAIN_SAFETY_MAX}) reached.`);
-      this.emit("systemEvent", `CHAIN: safety cap reached`);
-      this.recorder?.recordChain({
-        afterSpeakerId: agentId,
-        afterSpeaker: speaker?.name ?? agentId,
-        afterTranscript: transcript,
-        chainTurnCount: this.chainTurnCount,
-        addresseeKind,
-        addresseeName,
-        decision: "pause",
-        source: "safety_cap",
-        reason: `safety cap (${this.CHAIN_SAFETY_MAX})`,
-      });
-      this.chainTurnCount = 0;
-      this.beginEngagementQuestion(speaker);
-      return;
-    }
+    logger.info("ORCHESTRATOR", `${speaker?.name ?? agentId} done — chain step pending…`);
+    this.emit("systemEvent", `CHAIN: next step pending…`);
 
-    const isFirstReaction = this.chainTurnCount === 0;
-    let shouldChain = isFirstReaction;
-    let chainSource: "gemini" | "fallback" | "first_guaranteed" = "first_guaranteed";
-    let chainReason: string | undefined = isFirstReaction
-      ? "first reaction after human turn (guaranteed)"
-      : undefined;
+    this.transitionTo("IDLE", "agent done");
 
-    if (!isFirstReaction) {
-      if (this.routingEnabled) {
-        const decision = await shouldContinueChainWithGemini({
-          humanName: this.humanName,
-          turns: this.conversationTurns,
-          chainTurnCount: this.chainTurnCount,
-          lastSpeakerName: speaker?.name ?? agentId,
-          lastTranscript: transcript,
-          addresseeKind,
-          addresseeName,
-        });
-
-        if (generation !== this.selectionGeneration) return;
-
-        shouldChain = decision.continue;
-        chainSource = decision.source === "gemini" ? "gemini" : "fallback";
-        chainReason = decision.source === "gemini" ? decision.reason : undefined;
-        if (decision.source === "gemini") {
-          this.emit(
-            "systemEvent",
-            `GEMINI: chain ${shouldChain ? "continues" : "pauses"}${decision.reason ? ` — ${decision.reason}` : ""}`
-          );
-        }
-      } else {
-        shouldChain = Math.random() < this.CHAIN_REACTION_PROBABILITY;
-        chainSource = "fallback";
-        chainReason = shouldChain ? "random fallback (80%)" : "random fallback (stopped)";
-      }
-    }
-
-    this.recorder?.recordChain({
+    const chainRecord = {
       afterSpeakerId: agentId,
       afterSpeaker: speaker?.name ?? agentId,
       afterTranscript: transcript,
-      chainTurnCount: this.chainTurnCount,
-      addresseeKind,
-      addresseeName,
-      decision: shouldChain ? "continue" : "pause",
-      source: chainSource,
-      reason: chainReason,
-    });
+    };
 
-    if (shouldChain) {
-      logger.info(
-        "ORCHESTRATOR",
-        `${speaker?.name ?? agentId} done — ${isFirstReaction ? "first reaction (guaranteed)" : "chain continues"}`
-      );
-      this.emit("systemEvent", `CHAIN: reaction #${this.chainTurnCount + 1} pending…`);
-
-      this.transitionTo("IDLE", "agent done");
-      this.chainTurnCount++;
-      logger.info(
-        "ORCHESTRATOR",
-        `Chain reaction #${this.chainTurnCount} — reacting in ${this.CHAIN_REACTION_DELAY_MS}ms`
-      );
-
-      this.chainTimer = setTimeout(() => {
-        this.chainTimer = null;
-        if (this.state === "IDLE" && generation === this.selectionGeneration) {
-          void this.selectAndTriggerAgent("chain");
-        }
-      }, this.CHAIN_REACTION_DELAY_MS);
-      return;
-    }
-
-    logger.info("ORCHESTRATOR", "Chain ended — last speaker will invite human.");
-    this.emit("systemEvent", `CHAIN: conversation paused`);
-    this.chainTurnCount = 0;
-    this.beginEngagementQuestion(speaker);
+    this.chainTimer = setTimeout(() => {
+      this.chainTimer = null;
+      if (this.state === "IDLE" && generation === this.selectionGeneration) {
+        void this.selectAndTriggerAgent("chain", {
+          afterHuman: false,
+          chainRecord,
+        });
+      }
+    }, this.CHAIN_REACTION_DELAY_MS);
   }
 
-  /**
-   * Last speaker asks the Human one short question before the playout queue empties.
-   */
-  private beginEngagementQuestion(agent: AgentRecord | undefined): void {
+  private async requestHandoffLine(
+    agent: AgentRecord | undefined,
+    lastTranscript?: string
+  ): Promise<void> {
+    const generation = this.selectionGeneration;
     if (!agent || agent.session.state === "CLOSED") {
-      this.transitionTo("IDLE", "no engagement");
-      this.emit("humanTurnReady");
+      this.inviteHumanTurn();
       return;
     }
 
-    this.engagementTurnActive = true;
+    const readyAgents = this.agents.filter((a) => a.session.state !== "CLOSED");
+    const pick = await requestHandoffWithGemini({
+      humanName: this.humanName,
+      turns: this.conversationTurns,
+      candidates: readyAgents.map((a) => ({
+        id: a.id,
+        name: a.name,
+        systemPrompt: a.systemPrompt,
+        roleSummary: a.roleSummary,
+        peerProfile: a.peerProfile,
+      })),
+      meetingMetadata: this.buildMeetingMetadata(readyAgents),
+      lastSpeakerId: agent.id,
+      lastTranscript: lastTranscript ?? agent.session.getLastTranscript() ?? undefined,
+    });
+
+    if (generation !== this.selectionGeneration) return;
+
+    if (pick.source === "gemini" && pick.kind === "pause") {
+      this.playHandoffLine(agent, pick.handoff);
+      return;
+    }
+
+    logger.warn("ORCHESTRATOR", "Handoff generation failed — opening human turn.");
+    this.inviteHumanTurn();
+  }
+
+  private inviteHumanTurn(): void {
+    this.activeAgent = null;
+    this.transitionTo("IDLE", "human turn");
+    this.emit("humanTurnReady");
+  }
+
+  private playHandoffLine(agent: AgentRecord | undefined, handoffText: string): void {
+    const text = handoffText.trim();
+    if (!agent || agent.session.state === "CLOSED" || !text) {
+      this.inviteHumanTurn();
+      return;
+    }
+
+    this.handoffTurnActive = true;
     this.activeAgent = agent;
-    this.transitionTo("AGENT_SPEAKING", `${agent.name} engagement`);
+    this.transitionTo("AGENT_SPEAKING", `${agent.name} handoff`);
 
     this.recorder?.recordRouting({
       context: "engagement",
       selectedSpeakerId: agent.id,
       selectedSpeaker: agent.name,
       source: "engagement",
-      reason: "engagement question for human",
-      label: `ENGAGE: ${agent.name} → question for human`,
+      reason: "handoff",
+      label: `HANDOFF: ${agent.name} → human`,
     });
 
-    logger.info("ORCHESTRATOR", `${agent.name} posing engagement question to human.`);
-    this.emit("systemEvent", `ENGAGE: ${agent.name} → question for human`);
+    logger.info("ORCHESTRATOR", `${agent.name} inviting human with handoff line.`);
+    this.emit("systemEvent", `HANDOFF: ${agent.name} → question for human`);
     this.emit("humanInvited", agent.id, agent.name);
     this.emit("agentSpeakingStart", agent.id, agent.name);
 
-    const hooks = this.recorder?.beginAgentTurn(agent.id, agent.name, "engagement", false);
-    agent.session.triggerResponse(
-      this.composeTurnInstructions(
-        agent,
-        `Ask ${this.humanName} one short, direct question that invites them to speak next — ` +
-          "something specific to what was just discussed. " +
-          `Address ${this.humanName} as "you" or "${this.humanName}" — never say "${agent.name}" as if you are talking to yourself. ` +
-          "Keep it conversational and under 12 seconds. Only your voice; no meta commentary.",
-        { skipDissent: true }
-      ),
-      { hooks }
-    );
+    const hooks = this.recorder?.beginAgentTurn(agent.id, agent.name, "engagement", true);
+    agent.session.triggerResponse({ preGeneratedText: text, hooks });
   }
 
   // ─── FSM helpers ─────────────────────────────────────────────────────────────

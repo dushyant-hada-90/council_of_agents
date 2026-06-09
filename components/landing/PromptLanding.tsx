@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { SUGGESTED_PROMPTS } from "@/lib/config/suggestedPrompts";
@@ -30,6 +30,16 @@ export function PromptLanding({ isLoggedIn }: PromptLandingProps) {
   const [agents, setAgents] = useState<PlannedAgent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (step !== "loading" && step !== "approval") return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [step]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();

@@ -1,6 +1,5 @@
 export {
   transcribePcm16,
-  cleanupSttTranscript,
   STT_SAMPLE_RATE,
   estimateFinalSttTimeoutMs,
   getHumanSttSegmentBytes,
@@ -9,12 +8,8 @@ export {
 } from "./stt";
 export { synthesizeSpeech, pcmToBase64Chunks, TTS_SAMPLE_RATE, type SynthesizeOptions } from "./tts";
 export {
-  generateAgentResponse,
   generateStructuredJson,
-  generateJsonReply,
   pickSpeakerAndRespond,
-  type ChatMessage,
-  type GenerateAgentResponseInput,
   type StructuredJsonInput,
   type PickSpeakerAndRespondCandidate,
   type PickSpeakerAndRespondInput,
@@ -29,8 +24,7 @@ export {
 export { HumanSegmentTranscriber, type HumanSegmentTranscriberOptions } from "./humanSegmentTranscriber";
 export {
   pickSpeakerAndRespondWithGemini,
-  shouldContinueChainWithGemini,
+  requestHandoffWithGemini,
   type ConversationTurn,
   type MergedSpeakerPick,
-  type ChainContinueDecision,
 } from "./nextSpeakerRouter";

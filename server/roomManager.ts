@@ -62,12 +62,7 @@ export class ConferenceRoom {
     this.idleTimeoutMs = idleTimeoutMs;
     this.meetingId = meetingConfig.meetingId;
     this.config = meetingConfig;
-    this.agents = buildAgentConfigs(meetingConfig.humanName, meetingConfig.agents, {
-      topic: meetingConfig.topic,
-      goal: meetingConfig.goal,
-      context: meetingConfig.context,
-      instructions: meetingConfig.instructions,
-    });
+    this.agents = buildAgentConfigs(meetingConfig.humanName, meetingConfig.agents);
 
     this.mixer = new AudioMixer();
     this.sessionRecorder = new SessionRecorder(
@@ -114,6 +109,10 @@ export class ConferenceRoom {
     this.orchestrator = new Orchestrator(this.mixer, this.sessionRecorder, {
       humanName: meetingConfig.humanName,
       maxAiTurnsBeforeHuman: meetingConfig.maxAiTurnsBeforeHuman,
+      topic: meetingConfig.topic,
+      goal: meetingConfig.goal,
+      context: meetingConfig.context,
+      instructions: meetingConfig.instructions,
     });
     this.orchestrator.setTranscriptStatusProvider(() => this.humanTranscriptStatus);
 
@@ -245,7 +244,13 @@ export class ConferenceRoom {
       );
       this.agentSessions.push(session);
       this.mixer.registerAgent(session);
-      this.orchestrator.registerAgent(session, agentConfig.name, agentConfig.systemPrompt);
+      this.orchestrator.registerAgent(
+        session,
+        agentConfig.name,
+        agentConfig.systemPrompt,
+        agentConfig.roleSummary,
+        agentConfig.peerProfile
+      );
       session.on("transcriptDelta", (delta: string, agentId: string) => {
         this.touchActivity();
         this.sendToClient({
