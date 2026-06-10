@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Replicates the EXACT behavior of the TypeScript code that caused 429s
-This matches the token growth pattern seen in your logs
 """
 
 import os
@@ -11,6 +10,7 @@ import random
 import requests
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+import concurrent.futures  # FIXED: Import the module properly
 
 # Load .env
 def load_env():
@@ -122,7 +122,6 @@ def call_gemini(contents: str, system_instruction: str = SYSTEM_INSTRUCTIONS) ->
 def replicate_exact_typeScript_behavior(num_turns: int = 15):
     """
     Replicates the EXACT behavior of pickSpeakerAndRespond from TypeScript code
-    This includes the conversation growth pattern that caused 429s
     """
     print_colored(Colors.BLUE, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print_colored(Colors.BLUE, "  Replicating TypeScript pickSpeakerAndRespond Behavior")
@@ -142,10 +141,6 @@ Last line from Valerie: "What are the two options you're torn between?"
 
 Should another agent react?"""
         
-        # Log prompt size
-        prompt_chars = len(user_prompt)
-        print(f"    Prompt size: {prompt_chars} chars, ~{prompt_chars//4} tokens (approx)")
-        
         # Make the API call
         result = call_gemini(user_prompt)
         
@@ -163,9 +158,7 @@ Should another agent react?"""
                     print(f"      Response: {result['response_text'][:100]}")
             
             # GROW the conversation - THIS IS KEY
-            # The TypeScript code adds 3 sentences per turn after turn 1
             if turn > 1:
-                # EXACT sentences from your original bash script
                 s1 = f"Marcus: Let us thoroughly evaluate data metric matrix line item code alpha-{turn}."
                 s2 = f"Valerie: I counter that assertion because the emotional focus on step {turn} outweighs your data numbers."
                 s3 = f"Marcus: Dynamic parameter adjustment noted, progressing conference cycle iteration forward."
@@ -174,10 +167,13 @@ Should another agent react?"""
             
         elif result['status_code'] == 429:
             print_colored(Colors.RED, f"    ✗✗✗ 429 RATE LIMIT at turn {turn}! ✗✗✗")
-            print_colored(Colors.RED, f"    Error: {result.get('response', {}).get('error', {}).get('message', 'Unknown')}")
+            error_msg = result.get('response', {}).get('error', {}).get('message', 'Unknown')
+            print_colored(Colors.RED, f"    Error: {error_msg}")
             rate_limits.append(turn)
             
-            # Don't break - continue to see pattern
+            # CRITICAL: Continue to see if more 429s occur
+            # This matches production behavior where some requests succeed after 429
+            
         else:
             print_colored(Colors.RED, f"    ✗ HTTP {result['status_code']} ({result['elapsed_ms']}ms)")
             if 'error' in result:
@@ -190,77 +186,75 @@ Should another agent react?"""
     # Print token growth pattern
     print_colored(Colors.BLUE, "\n  Token Growth Pattern:")
     for i, tokens in enumerate(token_history, 1):
-        arrow = " → " if i < len(token_history) else ""
-        print(f"    Turn {i}: {tokens}{arrow}", end="")
-    print()
+        if i in rate_limits:
+            print_colored(Colors.RED, f"    Turn {i}: {tokens} ✗ 429")
+        else:
+            print(f"    Turn {i}: {tokens}")
     
     return rate_limits, token_history
 
-def replicate_token_oscillation_pattern():
+def test_with_retry_logic():
     """
-    Replicates the token oscillation pattern that appeared in your logs
-    Large → Small → Large → Large pattern
+    Test the SAME pattern but WITH exponential backoff retry logic
+    This shows the solution
     """
     print_colored(Colors.BLUE, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print_colored(Colors.BLUE, "  Replicating Token Oscillation Pattern (From Logs)")
+    print_colored(Colors.BLUE, "  TEST WITH RETRY LOGIC (Exponential Backoff)")
     print_colored(Colors.BLUE, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
-    # Start with medium conversation
-    conversation = INITIAL_CONVERSATION
+    def call_with_retry(contents, max_retries=5):
+        """Exponential backoff retry logic"""
+        for attempt in range(max_retries):
+            result = call_gemini(contents)
+            
+            if result['status_code'] != 429:
+                return result
+            
+            # Calculate delay: 1s, 2s, 4s, 8s, 16s
+            delay = (2 ** attempt)
+            print_colored(Colors.YELLOW, f"      Retry {attempt + 1}/{max_retries} after {delay}s")
+            time.sleep(delay)
+        
+        return result  # Return last result even if 429
     
-    # Add content to reach ~3500 tokens (like your logs)
-    for i in range(1, 30):
-        conversation += f"\nMarcus: Analysis point {i}: Data suggests correlation."
-        conversation += f"\nValerie: Counterpoint {i}: Human element matters."
+    conversation_history = INITIAL_CONVERSATION
+    rate_limits = 0
     
-    print_colored(Colors.YELLOW, "\n  Phase 1: Large context (~3500-4000 tokens)")
-    user_prompt = f"{conversation}\n\nShould another agent react?"
-    result1 = call_gemini(user_prompt)
+    for turn in range(1, 16):
+        print_colored(Colors.CYAN, f"\n  Turn {turn}/15")
+        
+        user_prompt = f"""{conversation_history}
+
+Last line from Valerie: "What are the two options you're torn between?"
+
+Should another agent react?"""
+        
+        result = call_with_retry(user_prompt)
+        
+        if result['status_code'] == 200:
+            tokens = result.get('prompt_tokens', 0)
+            print_colored(Colors.GREEN, f"    ✓ SUCCESS ({result['elapsed_ms']}ms) - Tokens: {tokens}")
+        elif result['status_code'] == 429:
+            print_colored(Colors.RED, f"    ✗ Still 429 after all retries")
+            rate_limits += 1
+        else:
+            print_colored(Colors.YELLOW, f"    ? HTTP {result['status_code']}")
+        
+        # Grow conversation
+        if turn > 1:
+            s1 = f"Marcus: Analysis point {turn}."
+            s2 = f"Valerie: Counterpoint {turn}."
+            s3 = f"Marcus: Resolution {turn}."
+            conversation_history = f"{conversation_history}\n{s1}\n{s2}\n{s3}"
+        
+        if turn < 15:
+            time.sleep(1.5)
     
-    if result1['status_code'] == 200:
-        tokens1 = result1.get('prompt_tokens', 0)
-        print_colored(Colors.GREEN, f"    ✓ Large context: {tokens1} tokens")
-    else:
-        print_colored(Colors.RED, f"    ✗ {result1['status_code']}")
-        return
-    
-    time.sleep(0.5)  # Short delay like in logs
-    
-    print_colored(Colors.YELLOW, "\n  Phase 2: RESET to small context (~200-400 tokens)")
-    small_conversation = "You: Hello.\nMarcus: Hi.\nValerie: Hello.\nMarcus: Quick update."
-    user_prompt = small_conversation
-    result2 = call_gemini(user_prompt)
-    
-    if result2['status_code'] == 200:
-        tokens2 = result2.get('prompt_tokens', 0)
-        print_colored(Colors.GREEN, f"    ✓ Small context (RESET): {tokens2} tokens")
-    else:
-        print_colored(Colors.RED, f"    ✗ {result2['status_code']}")
-        return
-    
-    time.sleep(0.2)  # VERY SHORT delay - THIS TRIGGERS 429
-    
-    print_colored(Colors.YELLOW, "\n  Phase 3: IMMEDIATE large context (NO delay) - CRITICAL")
-    user_prompt = f"{conversation}\n\nShould another agent react?"
-    result3 = call_gemini(user_prompt)
-    
-    if result3['status_code'] == 200:
-        tokens3 = result3.get('prompt_tokens', 0)
-        print_colored(Colors.GREEN, f"    ✓ Large context again: {tokens3} tokens")
-        print_colored(Colors.YELLOW, f"    Pattern: {tokens1} → {tokens2} → {tokens3} in 0.7s")
-    elif result3['status_code'] == 429:
-        print_colored(Colors.RED, "    ✗✗✗ 429 TRIGGERED! Pattern: Large → Reset → Immediate Large")
-        print_colored(Colors.RED, f"    Token oscillation: {tokens1} → {tokens2} → Large")
-    else:
-        print_colored(Colors.RED, f"    ✗ HTTP {result3['status_code']}")
-    
-    return result3['status_code'] == 429
+    print_colored(Colors.GREEN, f"\n  Rate limits with retry: {rate_limits}")
+    return rate_limits
 
 def run_stress_test(iterations: int = 5, concurrent: int = 3):
-    """
-    Run a stress test with concurrent requests to trigger rate limits
-    This simulates what would happen with multiple users
-    """
+    """Run a stress test with concurrent requests"""
     print_colored(Colors.BLUE, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print_colored(Colors.BLUE, f"  Stress Test: {concurrent} concurrent x {iterations} iterations")
     print_colored(Colors.BLUE, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -291,8 +285,6 @@ def run_stress_test(iterations: int = 5, concurrent: int = 3):
             time.sleep(random.uniform(0.5, 1.5))
         
         return results
-    
-    import concurrent.futures
     
     all_results = []
     rate_limits = 0
@@ -328,32 +320,46 @@ def main():
     # Test 1: Exact TypeScript behavior (15 turns)
     rate_limits, token_history = replicate_exact_typeScript_behavior(15)
     
-    # Test 2: Token oscillation pattern
-    triggered = replicate_token_oscillation_pattern()
-    
-    # Test 3: Concurrent stress test
-    stress_rate_limits = run_stress_test(iterations=5, concurrent=3)
+    # Test 2: Solution with retry logic
+    retry_rate_limits = test_with_retry_logic()
     
     # Summary
     print_colored(Colors.BLUE, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print_colored(Colors.BLUE, "  Summary")
+    print_colored(Colors.BLUE, "  SUMMARY & SOLUTION")
     print_colored(Colors.BLUE, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
-    print(f"  TypeScript behavior (15 turns): {len(rate_limits)} rate limits")
-    print(f"  Token oscillation pattern: {'TRIGGERED' if triggered else 'Not triggered'}")
-    print(f"  Concurrent stress test: {stress_rate_limits} rate limits")
+    print(f"\n  Current code: {len(rate_limits)} rate limits in 15 turns")
+    print(f"  With retry logic: {retry_rate_limits} rate limits survived")
     
-    if len(rate_limits) > 0 or triggered or stress_rate_limits > 0:
-        print_colored(Colors.RED, "\n  ⚠️ RATE LIMITS DETECTED!")
-        print_colored(Colors.YELLOW, "\n  The issue is caused by:")
-        print_colored(Colors.YELLOW, "    1. Rapid conversation growth (adding 3 sentences per turn)")
-        print_colored(Colors.YELLOW, "    2. The specific prompt format with 'Last line from Valerie'")
-        print_colored(Colors.YELLOW, "    3. No rate limit handling in your TypeScript code")
-        print_colored(Colors.YELLOW, "\n  Solution: Add exponential backoff retry logic")
-    else:
-        print_colored(Colors.GREEN, "\n  ✓ No rate limits detected")
-        print_colored(Colors.YELLOW, "  Your quota may be higher than the environment where logs came from")
-        print_colored(Colors.YELLOW, "  The TypeScript code itself needs retry logic for production")
+    print_colored(Colors.RED, "\n  ⚠️ YOUR TYPESCRIPT CODE NEEDS THIS FIX:")
+    print_colored(Colors.YELLOW, """
+  Add this function to your TypeScript code:
+
+  async function callGeminiWithRetry(
+    model: string,
+    body: GeminiGenerateBody,
+    operation: ChatModelOperation,
+    maxRetries: number = 5
+  ): Promise<GeminiPostResult> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await geminiPost(model, body, operation, Date.now());
+      } catch (err) {
+        const isRateLimit = err.message.includes('429') || 
+                           err.message.includes('RESOURCE_EXHAUSTED');
+        
+        if (!isRateLimit || attempt === maxRetries - 1) throw err;
+        
+        const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s, 8s, 16s
+        logger.warn('GEMINI_RETRY', `Rate limited, retrying in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw new Error('Max retries exceeded');
+  }
+
+  Then replace all geminiPost() calls with callGeminiWithRetry()
+  """)
 
 if __name__ == "__main__":
     main()

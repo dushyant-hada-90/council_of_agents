@@ -61,6 +61,7 @@ export interface MeetingRow {
   goal: string;
   context: string;
   instructions: string;
+  participant_name: string | null;
   max_ai_turns_before_human: MaxAiTurnsBeforeHuman;
   status: MeetingStatus;
   spoken_audio_seconds: number;
@@ -167,6 +168,7 @@ export interface Database {
           goal?: string;
           context?: string;
           instructions?: string;
+          participant_name?: string | null;
           max_ai_turns_before_human?: MaxAiTurnsBeforeHuman;
           status?: MeetingStatus;
           spoken_audio_seconds?: number;

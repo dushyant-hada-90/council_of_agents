@@ -12,6 +12,11 @@ export const JSON_SYSTEM_SUFFIX =
 export const CHAT_VOICE_APPEND =
   "Keep responses under 15 seconds of speech. Be conversational, not listy.";
 
+/** Appended to Gemini system prompts when Google Search grounding is enabled. */
+export const GOOGLE_SEARCH_GROUNDING_RULES = `You can use Google Search for current or time-sensitive facts (news, prices, weather, sports, recent events, "today", "latest").
+If the human asks for up-to-date information, search before you answer — do not guess or rely on outdated knowledge.
+Weave verified facts into your spoken line naturally; never say "I searched" or "according to the web" aloud.`;
+
 export const LIVE_TURN_VOICE_RULES = `Voice rules for all spoken lines:
 - Under 60 words (~20 seconds). First person when speaking as an agent.
 - React directly to what was just said. Never read instructions aloud.

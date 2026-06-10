@@ -101,7 +101,11 @@ async function loadAuthMeetingConfig(
   return {
     meetingId,
     userId,
-    humanName: userRow?.display_name ?? userRow?.username ?? "You",
+    humanName:
+      meetingRow.participant_name?.trim() ||
+      userRow?.display_name ||
+      userRow?.username ||
+      "You",
     topic: meetingRow.topic,
     goal: meetingRow.goal,
     context: meetingRow.context,
@@ -141,7 +145,7 @@ async function loadGuestMeetingConfig(
   return {
     meetingId,
     userId: null,
-    humanName: "You",
+    humanName: meetingRow.participant_name?.trim() || "You",
     topic: meetingRow.topic,
     goal: meetingRow.goal,
     context: meetingRow.context,

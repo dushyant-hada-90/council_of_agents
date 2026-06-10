@@ -12,6 +12,8 @@ export interface PlannedAgent {
 
 interface AgentApprovalPanelProps {
   refinedPrompt: string;
+  participantName: string;
+  onParticipantNameChange: (name: string) => void;
   agents: PlannedAgent[];
   onAgentsChange: (agents: PlannedAgent[]) => void;
   onApprove: () => void;
@@ -21,6 +23,8 @@ interface AgentApprovalPanelProps {
 
 export function AgentApprovalPanel({
   refinedPrompt,
+  participantName,
+  onParticipantNameChange,
   agents,
   onAgentsChange,
   onApprove,
@@ -32,10 +36,26 @@ export function AgentApprovalPanel({
     onAgentsChange(next);
   }
 
+  const participantNameValid = participantName.trim().length >= 1;
+
   return (
     <div className="max-w-4xl mx-auto px-6 py-10">
       <h2 className="text-2xl font-bold mb-2">Your council is ready</h2>
       <p className="text-gray-400 mb-8">{refinedPrompt}</p>
+
+      <div className="card mb-8 max-w-md">
+        <label className="block text-xs text-gray-500 mb-1">Your name</label>
+        <input
+          value={participantName}
+          onChange={(e) => onParticipantNameChange(e.target.value)}
+          placeholder="How should the advisors address you?"
+          className="w-full"
+          autoComplete="name"
+        />
+        <p className="text-xs text-gray-500 mt-2">
+          Agents will use this name when they speak to you in the meeting.
+        </p>
+      </div>
 
       <p className="text-sm text-gray-500 mb-4">
         Review who will join your discussion. You can edit names and prompts before starting.
@@ -79,7 +99,11 @@ export function AgentApprovalPanel({
       <button
         type="button"
         onClick={onApprove}
-        disabled={loading || agents.some((a) => !a.name.trim() || !a.systemPrompt.trim())}
+        disabled={
+          loading ||
+          !participantNameValid ||
+          agents.some((a) => !a.name.trim() || !a.systemPrompt.trim())
+        }
         className="btn-primary text-lg px-8 py-3 disabled:opacity-50"
       >
         {loading ? "Starting meeting…" : "Approve & start meeting"}

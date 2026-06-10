@@ -5,6 +5,7 @@ import {
   buildLiveTurnPrompt,
   formatLiveMeetingMetadata,
   JSON_SYSTEM_SUFFIX,
+  GOOGLE_SEARCH_GROUNDING_RULES,
   type LiveMeetingMetadata,
 } from "@/lib/prompts/prompts";
 import { logger } from "@/lib/logger";
@@ -206,6 +207,11 @@ function googleSearchGroundingEnabled(operation: ChatModelOperation): boolean {
   return allowed.includes(operation);
 }
 
+function withGoogleSearchPromptRules(systemPrompt: string, operation: ChatModelOperation): string {
+  if (!googleSearchGroundingEnabled(operation)) return systemPrompt;
+  return `${systemPrompt}\n\n${GOOGLE_SEARCH_GROUNDING_RULES}`;
+}
+
 function buildGeminiBody(
   systemPrompt: string,
   contents: Content[],
@@ -213,7 +219,7 @@ function buildGeminiBody(
   operation: ChatModelOperation
 ): GeminiGenerateBody {
   const body: GeminiGenerateBody = {
-    systemInstruction: { parts: [{ text: systemPrompt }] },
+    systemInstruction: { parts: [{ text: withGoogleSearchPromptRules(systemPrompt, operation) }] },
     contents,
     generationConfig,
     safetySettings: SAFETY_SETTINGS,
@@ -497,7 +503,7 @@ export async function pickSpeakerAndRespond(
   const reqStarted = logApiRequest(
     "GEMINI",
     "merged_turn",
-    `model=${modelName}, afterHuman=${input.afterHuman}, handoffOnly=${Boolean(input.handoffOnly)}, agents=${input.candidates.length}`
+    `model=${modelName}, googleSearch=${googleSearchGroundingEnabled("merged_turn") ? "on" : "off"}, afterHuman=${input.afterHuman}, handoffOnly=${Boolean(input.handoffOnly)}, agents=${input.candidates.length}`
   );
 
   try {

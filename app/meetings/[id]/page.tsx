@@ -106,6 +106,7 @@ export default async function MeetingPage({ params, searchParams }: Props) {
         const row = meeting as {
           refined_prompt?: string;
           topic?: string;
+          participant_name?: string | null;
           agents_snapshot?: Array<{
             id: string;
             name: string;
@@ -124,7 +125,7 @@ export default async function MeetingPage({ params, searchParams }: Props) {
           <GuestMeetingShell topic={row.topic ?? row.refined_prompt ?? "Guest meeting"}>
             <MeetingRoom
               meetingId={id}
-              humanName="You"
+              humanName={row.participant_name?.trim() || "You"}
               initialAgents={initialAgents}
               isGuest
               guestToken={guestToken}

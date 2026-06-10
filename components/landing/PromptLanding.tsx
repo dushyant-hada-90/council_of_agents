@@ -28,6 +28,7 @@ export function PromptLanding({ isLoggedIn }: PromptLandingProps) {
     instructions: "",
   });
   const [agents, setAgents] = useState<PlannedAgent[]>([]);
+  const [participantName, setParticipantName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -92,6 +93,7 @@ export function PromptLanding({ isLoggedIn }: PromptLandingProps) {
         body: JSON.stringify({
           originalPrompt: prompt.trim(),
           refinedPrompt,
+          participantName: participantName.trim(),
           ...meetingMeta,
           agents: agents.map((a) => ({
             id: a.id,
@@ -127,6 +129,8 @@ export function PromptLanding({ isLoggedIn }: PromptLandingProps) {
     return (
       <AgentApprovalPanel
         refinedPrompt={refinedPrompt}
+        participantName={participantName}
+        onParticipantNameChange={setParticipantName}
         agents={agents}
         onAgentsChange={setAgents}
         onApprove={handleApprove}

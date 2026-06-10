@@ -94,6 +94,7 @@ create table if not exists public.meetings (
   goal text not null default '',
   context text not null default '',
   instructions text not null default '',
+  participant_name text,
   max_ai_turns_before_human int not null default 4
     check (max_ai_turns_before_human in (2, 4, 6)),
   status text not null default 'scheduled'

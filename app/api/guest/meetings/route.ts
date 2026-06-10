@@ -15,11 +15,19 @@ import type { AgentSnapshot } from "@/lib/supabase/types";
 interface CreateGuestMeetingBody {
   originalPrompt: string;
   refinedPrompt: string;
+  participantName: string;
   topic: string;
   goal: string;
   context: string;
   instructions: string;
   agents: AgentSnapshot[];
+}
+
+function normalizeParticipantName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const name = raw.trim().replace(/\s+/g, " ");
+  if (name.length < 1 || name.length > 40) return null;
+  return name;
 }
 
 export async function POST(request: NextRequest) {
@@ -47,6 +55,14 @@ export async function POST(request: NextRequest) {
   }
 
   const minAgents = getEnv().GUEST_MIN_AGENTS;
+  const participantName = normalizeParticipantName(body.participantName);
+
+  if (!participantName) {
+    return NextResponse.json(
+      { error: "Please enter your name (1–40 characters)." },
+      { status: 400 }
+    );
+  }
 
   if (!body.agents?.length || body.agents.length < minAgents) {
     return NextResponse.json(
@@ -75,6 +91,7 @@ export async function POST(request: NextRequest) {
       goal: body.goal ?? "",
       context: body.context ?? "",
       instructions: body.instructions ?? "",
+      participant_name: participantName,
       max_ai_turns_before_human: getEnv().MAX_AI_TURNS_BEFORE_HUMAN,
       status: "scheduled",
     } as never)
